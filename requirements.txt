@@ -1,0 +1,8 @@
+Pillow
+psutil
+py3nvml
+pyinstaller
+pyserial
+pystray
+pywin32
+WMI
