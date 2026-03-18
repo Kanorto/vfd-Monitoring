@@ -346,13 +346,38 @@ def save_config(config):
 
 
 # --- НИЗКОУРОВНЕВАЯ ОТРИСОВКА ---
+def get_vfd_char_width(char):
+    if char in SPECIAL_CHARS:
+        return len(SPECIAL_CHARS[char])
+    return len(char.encode('cp866', errors='replace'))
+
+
+def get_vfd_text_width(text):
+    return sum(get_vfd_char_width(char) for char in str(text))
+
+
+def trim_vfd_text(text, width=LINE_WIDTH):
+    result = []
+    current_width = 0
+    for char in str(text):
+        char_width = get_vfd_char_width(char)
+        if current_width + char_width > width:
+            break
+        result.append(char)
+        current_width += char_width
+    return ''.join(result)
+
+
 def fit_text(text, width=LINE_WIDTH, align='left'):
-    text = str(text)[:width]
+    text = trim_vfd_text(text, width)
+    padding = max(0, width - get_vfd_text_width(text))
     if align == 'center':
-        return text.center(width)
+        left = padding // 2
+        right = padding - left
+        return (' ' * left) + text + (' ' * right)
     if align == 'right':
-        return text.rjust(width)
-    return text.ljust(width)
+        return (' ' * padding) + text
+    return text + (' ' * padding)
 
 
 
@@ -889,15 +914,15 @@ def download_and_stage_update(release_info):
 
         def subtitle():
             total = progress['total']
+            downloaded_mb = progress['downloaded'] / (1024 * 1024)
             if total > 0:
                 ratio = max(0.0, min(progress['downloaded'] / total, 1.0))
-                bars = min(8, max(1, int(ratio * 8)))
                 percent = int(ratio * 100)
-                return f"{percent:3d}% [{'#' * bars}{'.' * (8 - bars)}]"
-            size_mb = progress['downloaded'] / (1024 * 1024)
-            return f"{size_mb:4.1f} MB"
+                total_mb = total / (1024 * 1024)
+                return f"{percent:3d}% {downloaded_mb:4.1f}/{total_mb:4.1f}M"
+            return f"{downloaded_mb:4.1f} MB"
 
-        animator = StatusAnimator('СКАЧИВАЮ ОБН', subtitle).start()
+        animator = StatusAnimator('СКАЧИВАНИЕ', subtitle).start()
         try:
             final_path = download_update_asset(release_info, progress_callback=on_progress)
         except Exception as exc:
