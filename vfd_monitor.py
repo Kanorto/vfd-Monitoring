@@ -50,11 +50,13 @@ DISPLAY_FLAGS = {
 }
 DEFAULT_REPOSITORY = os.environ.get("VFD_MONITOR_GITHUB_REPO", "Kanorto/vfd-Monitoring")
 UPDATE_API_BASE = "https://api.github.com/repos/{repo}/releases/latest"
+UPDATE_HISTORY_API_BASE = "https://api.github.com/repos/{repo}/releases?per_page={limit}"
 UPDATE_DOWNLOAD_CHUNK = 1024 * 128
 UPDATE_TIMEOUT = 20
 UPDATE_ATTEMPTS = 4
 UPDATE_POLL_INTERVAL = 1800
 UPDATE_ALERT_THRESHOLD = 3
+CHANGELOG_HISTORY_LIMIT = 10
 STATUS_FRAMES = ['|', '/', '-', '\\']
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -295,6 +297,7 @@ def load_config():
         "pending_update_notes": "",
         "last_changelog_version": "",
         "last_changelog": "",
+        "release_history": [],
         "last_update_check": 0.0,
         "last_update_error": "",
         "last_release_url": "",
@@ -343,6 +346,46 @@ def save_config(config):
             json.dump(config, file, indent=4, ensure_ascii=False)
     except Exception as e:
         logging.error(f"Ошибка сохранения конфига: {e}")
+
+
+def build_release_entry(version='', notes='', release_url='', published_at=''):
+    return {
+        "version": sanitize_version(version),
+        "notes": format_release_notes(notes),
+        "release_url": str(release_url or '').strip(),
+        "published_at": str(published_at or '').strip(),
+    }
+
+
+def sanitize_release_history(history):
+    items = history if isinstance(history, list) else []
+    result = []
+    seen_versions = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        entry = build_release_entry(
+            version=item.get('version', ''),
+            notes=item.get('notes', ''),
+            release_url=item.get('release_url', ''),
+            published_at=item.get('published_at', ''),
+        )
+        version = entry['version']
+        if not version or version in seen_versions:
+            continue
+        seen_versions.add(version)
+        result.append(entry)
+        if len(result) >= CHANGELOG_HISTORY_LIMIT:
+            break
+    return result
+
+
+def store_release_history(entries):
+    cfg['release_history'] = sanitize_release_history(entries)
+    if cfg['release_history']:
+        cfg['last_changelog_version'] = cfg['release_history'][0]['version']
+        cfg['last_changelog'] = cfg['release_history'][0]['notes']
+    save_config(cfg)
 
 
 # --- НИЗКОУРОВНЕВАЯ ОТРИСОВКА ---
@@ -605,6 +648,115 @@ def format_release_notes(notes):
     return text
 
 
+def release_to_entry(release):
+    version = sanitize_version(release.get('tag_name') or release.get('name') or '')
+    if not version:
+        return None
+    return build_release_entry(
+        version=version,
+        notes=release.get('body', ''),
+        release_url=release.get('html_url') or get_release_page_url(version),
+        published_at=release.get('published_at') or release.get('created_at') or '',
+    )
+
+
+def merge_release_histories(*history_groups):
+    result = []
+    seen_versions = set()
+    for history in history_groups:
+        for item in sanitize_release_history(history):
+            version = item['version']
+            if version in seen_versions:
+                continue
+            seen_versions.add(version)
+            result.append(item)
+            if len(result) >= CHANGELOG_HISTORY_LIMIT:
+                return result
+    return result
+
+
+def get_recent_releases(limit=CHANGELOG_HISTORY_LIMIT):
+    repo = extract_repo_slug(cfg.get('github_repo', ''))
+    if not repo:
+        raise RuntimeError('В конфиге не указан github_repo')
+    url = UPDATE_HISTORY_API_BASE.format(repo=repo, limit=max(1, min(int(limit), CHANGELOG_HISTORY_LIMIT)))
+    releases = perform_json_request(url)
+    if not isinstance(releases, list):
+        raise RuntimeError('GitHub не вернул список релизов')
+
+    entries = []
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        entry = release_to_entry(release)
+        if entry is not None:
+            entries.append(entry)
+        if len(entries) >= CHANGELOG_HISTORY_LIMIT:
+            break
+    if not entries:
+        raise RuntimeError('В GitHub Releases пока нет записей changelog')
+    return entries
+
+
+def refresh_release_history():
+    cached_history = sanitize_release_history(cfg.get('release_history'))
+    try:
+        remote_history = get_recent_releases()
+        merged_history = merge_release_histories(remote_history, cached_history)
+        store_release_history(merged_history)
+        return merged_history
+    except Exception as exc:
+        logging.warning(f"Не удалось обновить историю changelog: {exc}")
+        if cached_history:
+            return cached_history
+        raise
+
+
+def remember_release_entry(version='', notes='', release_url='', published_at=''):
+    if not version:
+        return sanitize_release_history(cfg.get('release_history'))
+    entry = build_release_entry(
+        version=version,
+        notes=notes,
+        release_url=release_url,
+        published_at=published_at,
+    )
+    history = merge_release_histories([entry], cfg.get('release_history'))
+    store_release_history(history)
+    return history
+
+
+def build_changelog_text(history):
+    entries = sanitize_release_history(history)
+    if not entries:
+        fallback_version = sanitize_version(
+            cfg.get('pending_update_version')
+            or cfg.get('last_changelog_version')
+            or cfg.get('known_latest_version')
+            or APP_VERSION
+        )
+        fallback_notes = cfg.get('pending_update_notes') or cfg.get('last_changelog') or 'История изменений пока недоступна.'
+        entries = [build_release_entry(version=fallback_version, notes=fallback_notes)]
+
+    sections = []
+    total = len(entries)
+    for index, entry in enumerate(entries, start=1):
+        parts = [f"[{index:02d}/{total:02d}] Версия {entry['version']}"]
+        if entry.get('published_at'):
+            parts.append(f"Дата релиза: {entry['published_at']}")
+        if entry.get('release_url'):
+            parts.append(f"Ссылка: {entry['release_url']}")
+        parts.append("")
+        parts.append(entry['notes'])
+        sections.append('\n'.join(parts).strip())
+    separator = '\n\n' + ('=' * 78) + '\n\n'
+    return separator.join(sections)
+
+
+cfg["release_history"] = sanitize_release_history(cfg.get("release_history"))
+save_config(cfg)
+
+
 def get_release_page_url(version=''):
     repo = extract_repo_slug(cfg.get('github_repo', DEFAULT_REPOSITORY))
     if not repo:
@@ -776,6 +928,11 @@ def announce_version_change():
     cfg['last_update_error'] = ''
     cfg['last_alerted_version'] = ''
     save_config(cfg)
+    remember_release_entry(
+        version=current_version,
+        notes=notes,
+        release_url=cfg.get('last_release_url', '') or get_release_page_url(current_version),
+    )
 
     logging.info("Установлена новая версия %s (была %s)", current_version, previous_version or 'неизвестно')
     for line in notes.splitlines():
@@ -797,13 +954,22 @@ def get_latest_release():
         raise RuntimeError('GitHub не вернул номер версии релиза')
     notes = format_release_notes(release.get('body'))
     asset = pick_release_asset(release)
+    release_url = release.get('html_url') or get_release_page_url(version)
+    published_at = release.get('published_at') or release.get('created_at') or ''
+    remember_release_entry(
+        version=version,
+        notes=notes,
+        release_url=release_url,
+        published_at=published_at,
+    )
     return {
         'version': version,
         'notes': notes,
         'asset_name': asset.get('name', 'release.bin'),
         'asset_url': asset.get('browser_download_url', ''),
         'asset_size': int(asset.get('size') or 0),
-        'release_url': release.get('html_url') or get_release_page_url(version),
+        'release_url': release_url,
+        'published_at': published_at,
     }
 
 
@@ -869,6 +1035,7 @@ def check_for_updates(force=False):
             cfg['last_update_check'] = time.time()
             cfg['last_update_error'] = ''
             save_config(cfg)
+            refresh_release_history()
         except Exception as exc:
             cfg['last_update_check'] = time.time()
             register_update_failure(
@@ -942,6 +1109,12 @@ def download_and_stage_update(release_info):
         cfg['last_release_url'] = release_info.get('release_url', '')
         clear_update_failure_state()
         save_config(cfg)
+        remember_release_entry(
+            version=release_info['version'],
+            notes=release_info['notes'],
+            release_url=release_info.get('release_url', ''),
+            published_at=release_info.get('published_at', ''),
+        )
 
         logging.info("Скачано обновление %s -> %s", release_info['version'], final_path)
         show_temporary_message('ОБНОВЛЕНИЕ ГОТОВО', f"V{release_info['version']}", duration=4)
@@ -969,6 +1142,11 @@ def open_changelog_window(icon=None, item=None):
         import tkinter as tk
         from tkinter import scrolledtext
 
+        try:
+            history = refresh_release_history()
+        except Exception:
+            history = sanitize_release_history(cfg.get('release_history'))
+
         root = tk.Tk()
         root.title('Changelog VFD Monitor')
         root.geometry('760x520')
@@ -976,9 +1154,7 @@ def open_changelog_window(icon=None, item=None):
 
         text = scrolledtext.ScrolledText(root, wrap='word', font=('Consolas', 10))
         text.pack(fill='both', expand=True)
-        version = cfg.get('last_changelog_version') or cfg.get('pending_update_version') or cfg.get('known_latest_version') or APP_VERSION
-        changelog = cfg.get('last_changelog') or cfg.get('pending_update_notes') or 'История изменений пока недоступна.'
-        text.insert('1.0', f"Версия: {version}\n\n{changelog}")
+        text.insert('1.0', build_changelog_text(history))
         text.configure(state='disabled')
         root.mainloop()
 
@@ -1810,7 +1986,7 @@ def build_updates_submenu():
             install_update_and_exit,
             enabled=lambda item: bool(cfg.get('pending_update_path')) and os.path.exists(cfg.get('pending_update_path', '')),
         ),
-        pystray.MenuItem('Показать changelog', open_changelog_window),
+        pystray.MenuItem('Показать changelog (10 версий)', open_changelog_window),
     )
 
 
