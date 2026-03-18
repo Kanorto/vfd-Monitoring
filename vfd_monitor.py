@@ -26,8 +26,13 @@ import wmi
 from PIL import Image, ImageDraw
 from py3nvml import py3nvml as nvml
 
+import app_hotkeys
+import vfd_display
+from notes_engine import DEFAULT_STATE as NOTES_DEFAULT_STATE, NotesReminderManager
+from notes_gui import open_notes_reminders_window
+
 # --- НАСТРОЙКИ VFD ---
-APP_VERSION = os.environ.get("VFD_MONITOR_VERSION", "0.3.1")
+APP_VERSION = os.environ.get("VFD_MONITOR_VERSION", "1.0.0")
 BAUD = 9600
 CLR = b'\x0c'
 HOME = b'\x0b'
@@ -105,16 +110,8 @@ DEFAULT_LINE_SPACING = {
     "primary_compact": "",
     "secondary_compact": "",
 }
-DEFAULT_HOTKEYS = {
-    "toggle_display": "Ctrl+Alt+D",
-    "check_updates": "Ctrl+Alt+U",
-    "show_changelog": "Ctrl+Alt+C",
-}
-HOTKEY_LABELS = {
-    "toggle_display": "Вкл/выкл дисплей",
-    "check_updates": "Проверить обновления",
-    "show_changelog": "Показать changelog",
-}
+DEFAULT_HOTKEYS = app_hotkeys.DEFAULT_HOTKEYS
+HOTKEY_LABELS = app_hotkeys.HOTKEY_LABELS
 HOTKEY_CALLBACKS = {}
 MODIFIER_ALIASES = {
     "CTRL": "Ctrl",
@@ -191,6 +188,7 @@ manual_update_feedback = {
 }
 update_alert_lock = threading.Lock()
 hotkey_manager = None
+notes_manager = None
 
 
 def ensure_dir(path):
@@ -271,11 +269,7 @@ def canonicalize_hotkey(value):
 
 
 def sanitize_hotkeys(hotkeys):
-    raw_hotkeys = hotkeys if isinstance(hotkeys, dict) else {}
-    result = {}
-    for action, default in DEFAULT_HOTKEYS.items():
-        result[action] = canonicalize_hotkey(raw_hotkeys.get(action, default))
-    return result
+    return app_hotkeys.sanitize_hotkeys(hotkeys)
 
 
 def load_config():
@@ -308,6 +302,7 @@ def load_config():
         "line_spacing": DEFAULT_LINE_SPACING,
         "hotkeys_enabled": True,
         "hotkeys": DEFAULT_HOTKEYS,
+        "notes_reminders": NOTES_DEFAULT_STATE["notes_reminders"],
     }
     legacy_key_map = {
         "show_gpu": "show_gpu_usage",
@@ -327,6 +322,8 @@ def load_config():
     cfg["line_spacing"] = sanitize_spacing(cfg.get("line_spacing"))
     cfg["hotkeys"] = sanitize_hotkeys(cfg.get("hotkeys"))
     cfg["hotkeys_enabled"] = bool(cfg.get("hotkeys_enabled", True))
+    if not isinstance(cfg.get("notes_reminders"), dict):
+        cfg["notes_reminders"] = NOTES_DEFAULT_STATE["notes_reminders"]
     with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
         json.dump(cfg, file, indent=4, ensure_ascii=False)
     return cfg
@@ -342,6 +339,8 @@ def save_config(config):
         config["line_spacing"] = sanitize_spacing(config.get("line_spacing"))
         config["hotkeys"] = sanitize_hotkeys(config.get("hotkeys"))
         config["hotkeys_enabled"] = bool(config.get("hotkeys_enabled", True))
+        if not isinstance(config.get("notes_reminders"), dict):
+            config["notes_reminders"] = NOTES_DEFAULT_STATE["notes_reminders"]
         with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
             json.dump(config, file, indent=4, ensure_ascii=False)
     except Exception as e:
@@ -390,48 +389,74 @@ def store_release_history(entries):
 
 # --- НИЗКОУРОВНЕВАЯ ОТРИСОВКА ---
 def get_vfd_char_width(char):
-    if char in SPECIAL_CHARS:
-        return len(SPECIAL_CHARS[char])
-    return len(char.encode('cp866', errors='replace'))
+    return vfd_display.get_vfd_char_width(char, SPECIAL_CHARS)
 
 
 def get_vfd_text_width(text):
-    return sum(get_vfd_char_width(char) for char in str(text))
+    return vfd_display.get_vfd_text_width(text, SPECIAL_CHARS)
 
 
 def trim_vfd_text(text, width=LINE_WIDTH):
-    result = []
-    current_width = 0
-    for char in str(text):
-        char_width = get_vfd_char_width(char)
-        if current_width + char_width > width:
-            break
-        result.append(char)
-        current_width += char_width
-    return ''.join(result)
+    return vfd_display.trim_vfd_text(text, width=width, special_chars=SPECIAL_CHARS)
 
 
 def fit_text(text, width=LINE_WIDTH, align='left'):
-    text = trim_vfd_text(text, width)
-    padding = max(0, width - get_vfd_text_width(text))
-    if align == 'center':
-        left = padding // 2
-        right = padding - left
-        return (' ' * left) + text + (' ' * right)
-    if align == 'right':
-        return (' ' * padding) + text
-    return text + (' ' * padding)
+    return vfd_display.fit_text(text, width=width, align=align, special_chars=SPECIAL_CHARS)
 
+
+
+notes_manager = NotesReminderManager(lambda: cfg, save_config, width_fn=get_vfd_char_width, width=LINE_WIDTH)
+
+
+def get_active_overlay_item():
+    if notes_manager is None:
+        return None
+    try:
+        return notes_manager.get_current_display()
+    except Exception as exc:
+        logging.error(f"Ошибка overlay-менеджера: {exc}")
+        return None
+
+
+def show_notes_window(icon=None, item=None):
+    open_notes_reminders_window(notes_manager, initial_tab='notes', on_refresh=refresh_menu)
+
+
+def show_reminders_window(icon=None, item=None):
+    open_notes_reminders_window(notes_manager, initial_tab='reminders', on_refresh=refresh_menu)
+
+
+def cycle_overlay_item(direction):
+    if notes_manager is None:
+        return
+    item = notes_manager.manual_cycle(direction)
+    if item is not None:
+        title = 'ЗАМЕТКА' if str(item.get('id', '')).startswith('note_') else 'НАПОМН'
+        preview = (item.get('title') or item.get('text') or '')[:LINE_WIDTH]
+        if preview:
+            show_temporary_message(title, preview, duration=1.2)
+
+
+def hide_active_overlay_item():
+    active = get_active_overlay_item()
+    if active is None:
+        return
+    notes_manager.mark_item(active.kind, active.item_id, 'hide')
+    show_temporary_message('СКРЫТО', active.title[:LINE_WIDTH], duration=1.5)
+    refresh_menu()
+
+
+def complete_active_overlay_item():
+    active = get_active_overlay_item()
+    if active is None:
+        return
+    notes_manager.mark_item(active.kind, active.item_id, 'done')
+    show_temporary_message('ВЫПОЛНЕНО', active.title[:LINE_WIDTH], duration=1.5)
+    refresh_menu()
 
 
 def encode_vfd_text(text):
-    encoded = bytearray()
-    for char in text:
-        if char in SPECIAL_CHARS:
-            encoded.extend(SPECIAL_CHARS[char])
-            continue
-        encoded.extend(char.encode('cp866', errors='replace'))
-    return bytes(encoded)
+    return vfd_display.encode_vfd_text(text, SPECIAL_CHARS)
 
 
 
@@ -771,9 +796,26 @@ def refresh_menu(icon=None):
     target_icon = icon or tray_icon
     if target_icon is not None:
         try:
+            if hasattr(target_icon, 'menu'):
+                target_icon.menu = build_main_menu()
             target_icon.update_menu()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("Не удалось обновить меню трея: %s", exc)
+
+
+def safe_tray_callback(callback, refresh_after=False):
+    def wrapped(icon=None, item=None):
+        try:
+            return callback(icon, item)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            logging.exception("Ошибка tray callback %s", getattr(callback, '__name__', 'callback'))
+            show_temporary_message('ОШИБКА', trim_vfd_text(str(exc), LINE_WIDTH), duration=2.5)
+        finally:
+            if refresh_after:
+                refresh_menu(icon)
+    return wrapped
 
 
 def show_manual_update_alert(version, release_url, error_text):
@@ -1339,10 +1381,40 @@ def execute_hotkey_show_changelog():
     open_changelog_window(None, None)
 
 
+def execute_hotkey_open_notes_window():
+    show_notes_window(None, None)
+
+
+def execute_hotkey_open_reminders_window():
+    show_reminders_window(None, None)
+
+
+def execute_hotkey_next_overlay_item():
+    cycle_overlay_item(1)
+
+
+def execute_hotkey_prev_overlay_item():
+    cycle_overlay_item(-1)
+
+
+def execute_hotkey_hide_overlay_item():
+    hide_active_overlay_item()
+
+
+def execute_hotkey_complete_overlay_item():
+    complete_active_overlay_item()
+
+
 HOTKEY_CALLBACKS.update({
     "toggle_display": execute_hotkey_toggle_display,
     "check_updates": execute_hotkey_check_updates,
     "show_changelog": execute_hotkey_show_changelog,
+    "open_notes_window": execute_hotkey_open_notes_window,
+    "open_reminders_window": execute_hotkey_open_reminders_window,
+    "next_overlay_item": execute_hotkey_next_overlay_item,
+    "prev_overlay_item": execute_hotkey_prev_overlay_item,
+    "hide_overlay_item": execute_hotkey_hide_overlay_item,
+    "complete_overlay_item": execute_hotkey_complete_overlay_item,
 })
 
 
@@ -1367,152 +1439,12 @@ def toggle_hotkeys(icon, item):
 
 
 def open_hotkeys_settings(icon=None, item=None):
-    def worker():
-        import tkinter as tk
-        from tkinter import messagebox, ttk
-
-        root = tk.Tk()
-        root.title("Горячие клавиши VFD Monitor")
-        root.attributes('-topmost', True)
-        root.resizable(False, False)
-
-        state_var = tk.BooleanVar(value=cfg.get("hotkeys_enabled", True))
-        value_vars = {
-            action: tk.StringVar(value=format_hotkey_preview(cfg.get("hotkeys", {}).get(action, '')))
-            for action in DEFAULT_HOTKEYS
-        }
-        local_hotkeys = dict(cfg.get("hotkeys", {}))
-
-        pressed_modifiers = set()
-        capture_window = {"value": None}
-
-        def normalize_combo(modifiers, key_name):
-            ordered = [name for name in ["Ctrl", "Alt", "Shift", "Win"] if name in modifiers]
-            return '+'.join(ordered + [key_name]) if key_name else '+'.join(ordered)
-
-        def start_capture(action):
-            if capture_window["value"] is not None:
-                capture_window["value"].destroy()
-
-            pressed_modifiers.clear()
-            dialog = tk.Toplevel(root)
-            dialog.title(f"Запись: {HOTKEY_LABELS[action]}")
-            dialog.attributes('-topmost', True)
-            dialog.resizable(False, False)
-            dialog.grab_set()
-            capture_window["value"] = dialog
-
-            def close_capture():
-                capture_window["value"] = None
-                dialog.destroy()
-
-            hint_var = tk.StringVar(value="Нажмите комбинацию, затем отпустите клавиши.")
-            ttk.Label(dialog, text=HOTKEY_LABELS[action], font=('Segoe UI', 10, 'bold')).pack(padx=16, pady=(12, 8))
-            ttk.Label(dialog, textvariable=hint_var, width=40, anchor='center').pack(padx=16, pady=(0, 12))
-
-            def on_press(event):
-                key = event.keysym.lower()
-                if key in ('control_l', 'control_r'):
-                    pressed_modifiers.add('Ctrl')
-                    hint_var.set(normalize_combo(pressed_modifiers, ''))
-                    return
-                if key in ('alt_l', 'alt_r', 'meta_l', 'meta_r'):
-                    pressed_modifiers.add('Alt')
-                    hint_var.set(normalize_combo(pressed_modifiers, ''))
-                    return
-                if key in ('shift_l', 'shift_r'):
-                    pressed_modifiers.add('Shift')
-                    hint_var.set(normalize_combo(pressed_modifiers, ''))
-                    return
-                if key in ('super_l', 'super_r', 'win_l', 'win_r'):
-                    pressed_modifiers.add('Win')
-                    hint_var.set(normalize_combo(pressed_modifiers, ''))
-                    return
-
-                key_name = event.keysym.upper() if len(event.keysym) == 1 else event.keysym.replace('_', '').upper()
-                combo = canonicalize_hotkey(normalize_combo(pressed_modifiers, key_name))
-                if combo:
-                    local_hotkeys[action] = combo
-                    value_vars[action].set(combo)
-                    close_capture()
-
-            def on_release(event):
-                key = event.keysym.lower()
-                if key in ('control_l', 'control_r'):
-                    pressed_modifiers.discard('Ctrl')
-                elif key in ('alt_l', 'alt_r', 'meta_l', 'meta_r'):
-                    pressed_modifiers.discard('Alt')
-                elif key in ('shift_l', 'shift_r'):
-                    pressed_modifiers.discard('Shift')
-                elif key in ('super_l', 'super_r', 'win_l', 'win_r'):
-                    pressed_modifiers.discard('Win')
-
-            dialog.bind('<KeyPress>', on_press)
-            dialog.bind('<KeyRelease>', on_release)
-            dialog.bind('<Escape>', lambda event: close_capture())
-            dialog.protocol("WM_DELETE_WINDOW", close_capture)
-            dialog.focus_force()
-
-        frame = ttk.Frame(root, padding=14)
-        frame.pack(fill='both', expand=True)
-
-        ttk.Checkbutton(frame, text='Включить глобальные горячие клавиши', variable=state_var).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 12))
-
-        row = 1
-        for action, label in HOTKEY_LABELS.items():
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=4)
-            ttk.Entry(frame, textvariable=value_vars[action], state='readonly', width=24).grid(row=row, column=1, sticky='ew', pady=4)
-            button_frame = ttk.Frame(frame)
-            button_frame.grid(row=row, column=2, sticky='e', pady=4)
-            ttk.Button(button_frame, text='Записать', command=lambda action_name=action: start_capture(action_name)).pack(side='left', padx=(0, 6))
-            ttk.Button(
-                button_frame,
-                text='Очистить',
-                command=lambda action_name=action: (local_hotkeys.__setitem__(action_name, ''), value_vars[action_name].set('Не назначено')),
-            ).pack(side='left')
-            row += 1
-
-        ttk.Label(
-            frame,
-            text="Шаблоны форматирования и отступы редактируются в vfd_config.json\nразделами metric_formats и line_spacing.",
-            justify='left',
-        ).grid(row=row, column=0, columnspan=3, sticky='w', pady=(12, 10))
-        row += 1
-
-        button_bar = ttk.Frame(frame)
-        button_bar.grid(row=row, column=0, columnspan=3, sticky='e')
-        ttk.Button(button_bar, text='Открыть конфиг', command=open_config_file).pack(side='left', padx=(0, 8))
-
-        def save_and_close():
-            normalized = sanitize_hotkeys(local_hotkeys)
-            duplicates = {}
-            for action, hotkey_value in normalized.items():
-                if not hotkey_value:
-                    continue
-                if hotkey_value in duplicates:
-                    messagebox.showerror(
-                        "Повтор клавиш",
-                        f"Комбинация {hotkey_value} уже назначена для '{HOTKEY_LABELS[duplicates[hotkey_value]]}'.",
-                        parent=root,
-                    )
-                    return
-                if parse_hotkey(hotkey_value) is None:
-                    messagebox.showerror("Ошибка", f"Комбинация {hotkey_value} не поддерживается.", parent=root)
-                    return
-                duplicates[hotkey_value] = action
-            cfg["hotkeys_enabled"] = bool(state_var.get())
-            cfg["hotkeys"] = normalized
-            save_config(cfg)
-            reload_hotkeys()
-            root.destroy()
-
-        ttk.Button(button_bar, text='Сохранить', command=save_and_close).pack(side='left', padx=(0, 8))
-        ttk.Button(button_bar, text='Отмена', command=root.destroy).pack(side='left')
-
-        frame.columnconfigure(1, weight=1)
-        root.mainloop()
-
-    threading.Thread(target=worker, daemon=True).start()
+    app_hotkeys.open_hotkeys_settings_window(
+        config_getter=lambda: cfg,
+        save_callback=save_config,
+        reload_callback=reload_hotkeys,
+        open_config_callback=open_config_file,
+    )
 
 
 # --- ИНТЕРФЕЙС И ТРЕЙ ---
@@ -1676,17 +1608,7 @@ def get_gpu_metrics():
 
 
 def fmt_v(value):
-    kb = value / 1024
-    if kb < 1:
-        return " 0K"
-    if kb < 100:
-        return f"{int(kb):2d}K"
-    if kb < 1000:
-        return f"{int(kb // 100):1d}00"
-    mb = kb / 1024
-    if mb < 10:
-        return f" {int(mb)}M"
-    return f"{min(int(mb), 99):2d}M"
+    return vfd_display.fmt_v(value)
 
 
 
@@ -1701,160 +1623,78 @@ def find_vfd():
 
 
 def get_metric_templates(metric_name):
-    metric_formats = cfg.get("metric_formats", {})
-    templates = metric_formats.get(metric_name)
-    if isinstance(templates, list) and templates:
-        return templates
-    return list(DEFAULT_METRIC_FORMATS[metric_name])
+    return vfd_display.get_metric_templates(cfg.get("metric_formats", {}), DEFAULT_METRIC_FORMATS, metric_name)
 
 
 def apply_template(template, **kwargs):
-    try:
-        return str(template).format(**kwargs)
-    except Exception as exc:
-        logging.warning("Некорректный шаблон '%s': %s", template, exc)
-        return ''
+    return vfd_display.apply_template(template, **kwargs)
 
 
 def build_usage_options(metric_name, full_prefix, short_prefix, percent, temp, show_usage, show_temp):
-    options = []
-    templates = get_metric_templates(metric_name)
-    values = {
-        "usage": percent if percent is not None else 0,
-        "temp": temp if temp is not None else 0,
-        "full_prefix": full_prefix,
-        "short_prefix": short_prefix,
-        "degree": DEG_CHAR,
-    }
-    if show_usage and percent is not None and show_temp and temp is not None:
-        for template in templates:
-            rendered = apply_template(template, **values)
-            if rendered and rendered not in options:
-                options.append(rendered)
-    elif show_usage and percent is not None:
-        for template in templates:
-            if '{temp' in str(template):
-                continue
-            rendered = apply_template(template, **values)
-            if rendered and rendered not in options:
-                options.append(rendered)
-    elif show_temp and temp is not None:
-        for template in templates:
-            if '{usage' in str(template):
-                continue
-            rendered = apply_template(template, **values)
-            if rendered and rendered not in options:
-                options.append(rendered)
-    return options
+    return vfd_display.build_usage_options(
+        cfg.get("metric_formats", {}),
+        DEFAULT_METRIC_FORMATS,
+        metric_name,
+        full_prefix,
+        short_prefix,
+        percent,
+        temp,
+        show_usage,
+        show_temp,
+        DEG_CHAR,
+    )
 
 
 
 def render_segments(segment_options, width=LINE_WIDTH, separator=' ', compact_separator=''):
-    if not segment_options:
-        return fit_text('', width, align='center')
-
-    indexes = [0] * len(segment_options)
-    while True:
-        text = separator.join(options[index] for options, index in zip(segment_options, indexes))
-        if len(text) <= width:
-            return fit_text(text, width, align='center')
-
-        candidate = None
-        best_delta = 0
-        for idx, options in enumerate(segment_options):
-            if indexes[idx] >= len(options) - 1:
-                continue
-            current_length = len(options[indexes[idx]])
-            next_length = len(options[indexes[idx] + 1])
-            delta = current_length - next_length
-            if delta > best_delta:
-                best_delta = delta
-                candidate = idx
-
-        if candidate is None:
-            compact = compact_separator.join(options[-1] for options in segment_options)
-            return fit_text(compact, width, align='center')
-
-        indexes[candidate] += 1
+    return vfd_display.render_segments(
+        segment_options,
+        width=width,
+        separator=separator,
+        compact_separator=compact_separator,
+        special_chars=SPECIAL_CHARS,
+    )
 
 
 
 def build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent):
-    segments = []
-    cpu_options = build_usage_options(
-        'cpu',
-        'CPU',
-        'C',
-        cpu_percent,
-        cpu_temp,
-        cfg.get("show_cpu_usage", True),
-        cfg.get("show_cpu_temp", True),
-    )
-    if cpu_options:
-        segments.append(cpu_options)
-
-    gpu_options = build_usage_options(
-        'gpu',
-        'GPU',
-        'G',
-        gpu_percent,
-        gpu_temp,
-        cfg.get("show_gpu_usage", True),
-        cfg.get("show_gpu_temp", True),
-    )
-    if gpu_options:
-        segments.append(gpu_options)
-
-    if cfg.get("show_ram", True):
-        ram_options = []
-        for template in get_metric_templates("ram"):
-            rendered = apply_template(template, value=ram_percent)
-            if rendered and rendered not in ram_options:
-                ram_options.append(rendered)
-        if ram_options:
-            segments.append(ram_options)
-    return segments
+    return vfd_display.build_primary_segments(cfg, DEFAULT_METRIC_FORMATS, cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent, DEG_CHAR)
 
 
 
 def build_io_segments(disk_read, disk_write, net_in, net_out):
-    segments = []
-    if cfg.get("show_disk", True):
-        disk_options = []
-        for template in get_metric_templates("disk"):
-            rendered = apply_template(template, read=fmt_v(disk_read), write=fmt_v(disk_write))
-            if rendered and rendered not in disk_options:
-                disk_options.append(rendered)
-        if disk_options:
-            segments.append(disk_options)
-    if cfg.get("show_network", True):
-        network_options = []
-        for template in get_metric_templates("network"):
-            rendered = apply_template(template, recv=fmt_v(net_in), send=fmt_v(net_out))
-            if rendered and rendered not in network_options:
-                network_options.append(rendered)
-        if network_options:
-            segments.append(network_options)
-    return segments
+    return vfd_display.build_io_segments(cfg, DEFAULT_METRIC_FORMATS, disk_read, disk_write, net_in, net_out)
 
 
 
 def build_line1(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent):
-    spacing = cfg.get("line_spacing", DEFAULT_LINE_SPACING)
-    return render_segments(
-        build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent),
-        separator=spacing.get("primary", " "),
-        compact_separator=spacing.get("primary_compact", ""),
+    return vfd_display.build_line1(
+        cfg,
+        DEFAULT_LINE_SPACING,
+        DEFAULT_METRIC_FORMATS,
+        SPECIAL_CHARS,
+        DEG_CHAR,
+        cpu_percent,
+        cpu_temp,
+        gpu_percent,
+        gpu_temp,
+        ram_percent,
+        width=LINE_WIDTH,
     )
 
 
 
 def build_line2(disk_read, disk_write, net_in, net_out):
-    spacing = cfg.get("line_spacing", DEFAULT_LINE_SPACING)
-    return render_segments(
-        build_io_segments(disk_read, disk_write, net_in, net_out),
-        separator=spacing.get("secondary", " "),
-        compact_separator=spacing.get("secondary_compact", ""),
+    return vfd_display.build_line2(
+        cfg,
+        DEFAULT_LINE_SPACING,
+        DEFAULT_METRIC_FORMATS,
+        SPECIAL_CHARS,
+        disk_read,
+        disk_write,
+        net_in,
+        net_out,
+        width=LINE_WIDTH,
     )
 
 
@@ -1926,6 +1766,12 @@ def monitoring_thread():
                 time.sleep(0.2)
                 continue
 
+            overlay_item = get_active_overlay_item()
+            if overlay_item is not None:
+                write_screen(overlay_item.line1, overlay_item.line2)
+                time.sleep(0.15)
+                continue
+
             now = time.time()
             dt = now - last_ts
             if dt < current_interval:
@@ -1970,7 +1816,7 @@ def build_metrics_submenu():
         items.append(
             pystray.MenuItem(
                 label,
-                make_metric_toggle(key),
+                safe_tray_callback(make_metric_toggle(key), refresh_after=True),
                 checked=lambda item, config_key=key: is_metric_enabled(config_key),
             )
         )
@@ -1980,22 +1826,59 @@ def build_metrics_submenu():
 
 def build_updates_submenu():
     return pystray.Menu(
-        pystray.MenuItem('Проверить сейчас', manual_check_updates),
+        pystray.MenuItem('Проверить сейчас', safe_tray_callback(manual_check_updates, refresh_after=True)),
         pystray.MenuItem(
             'Установить и перезапустить',
-            install_update_and_exit,
+            safe_tray_callback(install_update_and_exit),
             enabled=lambda item: bool(cfg.get('pending_update_path')) and os.path.exists(cfg.get('pending_update_path', '')),
         ),
-        pystray.MenuItem('Показать changelog (10 версий)', open_changelog_window),
+        pystray.MenuItem('Показать changelog (10 версий)', safe_tray_callback(open_changelog_window)),
     )
 
 
 def build_hotkeys_submenu():
     return pystray.Menu(
-        pystray.MenuItem('Включить горячие клавиши', toggle_hotkeys, checked=lambda item: cfg.get("hotkeys_enabled", True)),
-        pystray.MenuItem('Настроить клавиши...', open_hotkeys_settings),
+        pystray.MenuItem('Включить горячие клавиши', safe_tray_callback(toggle_hotkeys, refresh_after=True), checked=lambda item: cfg.get("hotkeys_enabled", True)),
+        pystray.MenuItem('Настроить клавиши...', safe_tray_callback(open_hotkeys_settings)),
     )
 
+
+def build_notes_reminders_submenu():
+    return pystray.Menu(
+        pystray.MenuItem('Открыть заметки', safe_tray_callback(show_notes_window)),
+        pystray.MenuItem('Открыть напоминания', safe_tray_callback(show_reminders_window)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Следующий элемент', safe_tray_callback(lambda icon, item: cycle_overlay_item(1), refresh_after=True)),
+        pystray.MenuItem('Предыдущий элемент', safe_tray_callback(lambda icon, item: cycle_overlay_item(-1), refresh_after=True)),
+        pystray.MenuItem('Скрыть активный', safe_tray_callback(lambda icon, item: hide_active_overlay_item(), refresh_after=True)),
+        pystray.MenuItem('Завершить активный', safe_tray_callback(lambda icon, item: complete_active_overlay_item(), refresh_after=True)),
+    )
+
+
+def build_speed_submenu():
+    return pystray.Menu(
+        pystray.MenuItem('0.5 сек', safe_tray_callback(make_speed_setter(0.5), refresh_after=True), radio=True, checked=lambda item: current_interval == 0.5),
+        pystray.MenuItem('1.0 сек (Стандарт)', safe_tray_callback(make_speed_setter(1.0), refresh_after=True), radio=True, checked=lambda item: current_interval == 1.0),
+        pystray.MenuItem('5.0 сек', safe_tray_callback(make_speed_setter(5.0), refresh_after=True), radio=True, checked=lambda item: current_interval == 5.0),
+        pystray.MenuItem('Свой вариант...', safe_tray_callback(set_custom_speed, refresh_after=True), radio=True, checked=lambda item: current_interval not in [0.5, 1.0, 5.0]),
+    )
+
+
+def build_main_menu():
+    return pystray.Menu(
+        pystray.MenuItem('Вкл/Выкл дисплей', safe_tray_callback(toggle_display, refresh_after=True)),
+        pystray.MenuItem('Что показывать', build_metrics_submenu()),
+        pystray.MenuItem('Скорость обновления', build_speed_submenu()),
+        pystray.MenuItem('Горячие клавиши', build_hotkeys_submenu()),
+        pystray.MenuItem('Заметки и напоминания', build_notes_reminders_submenu()),
+        pystray.MenuItem('Обновления', build_updates_submenu()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Открыть конфиг', safe_tray_callback(open_config_file)),
+        pystray.MenuItem('Открыть логи', safe_tray_callback(open_logs)),
+        pystray.MenuItem('Автозапуск с Windows', safe_tray_callback(toggle_autostart, refresh_after=True), checked=lambda item: cfg.get("autostart", False)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Выход', exit_app),
+    )
 
 
 def main():
@@ -2012,31 +1895,10 @@ def main():
     updater = threading.Thread(target=update_worker_loop, daemon=True)
     updater.start()
 
-    hotkey_manager = HotkeyManager()
+    hotkey_manager = app_hotkeys.HotkeyManager(lambda: cfg, lambda: HOTKEY_CALLBACKS)
     hotkey_manager.start()
 
-    speed_submenu = pystray.Menu(
-        pystray.MenuItem('0.5 сек', make_speed_setter(0.5), radio=True, checked=lambda item: current_interval == 0.5),
-        pystray.MenuItem('1.0 сек (Стандарт)', make_speed_setter(1.0), radio=True, checked=lambda item: current_interval == 1.0),
-        pystray.MenuItem('5.0 сек', make_speed_setter(5.0), radio=True, checked=lambda item: current_interval == 5.0),
-        pystray.MenuItem('Свой вариант...', set_custom_speed, radio=True, checked=lambda item: current_interval not in [0.5, 1.0, 5.0]),
-    )
-
-    menu = pystray.Menu(
-        pystray.MenuItem('Вкл/Выкл дисплей', toggle_display),
-        pystray.MenuItem('Что показывать', build_metrics_submenu()),
-        pystray.MenuItem('Скорость обновления', speed_submenu),
-        pystray.MenuItem('Горячие клавиши', build_hotkeys_submenu()),
-        pystray.MenuItem('Обновления', build_updates_submenu()),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem('Открыть конфиг', open_config_file),
-        pystray.MenuItem('Открыть логи', open_logs),
-        pystray.MenuItem('Автозапуск с Windows', toggle_autostart, checked=lambda item: cfg.get("autostart", False)),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem('Выход', exit_app),
-    )
-
-    tray_icon = pystray.Icon("VFD_Monitor", create_image(), f"VFD PC Monitor v{APP_VERSION}", menu)
+    tray_icon = pystray.Icon("VFD_Monitor", create_image(), f"VFD PC Monitor v{APP_VERSION}", build_main_menu())
     tray_icon.run()
 
 
