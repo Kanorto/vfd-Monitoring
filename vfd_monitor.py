@@ -796,8 +796,6 @@ def refresh_menu(icon=None):
     target_icon = icon or tray_icon
     if target_icon is not None:
         try:
-            if hasattr(target_icon, 'menu'):
-                target_icon.menu = build_main_menu()
             target_icon.update_menu()
         except Exception as exc:
             logging.warning("Не удалось обновить меню трея: %s", exc)

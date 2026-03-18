@@ -52,10 +52,24 @@ def encode_vfd_text(text: str, special_chars: dict[str, bytes] | None = None) ->
 
 
 def fmt_v(value: float) -> str:
-    mb = value / 1024 / 1024
-    if mb >= 999.5:
-        return f"{mb / 1024:.1f}G"
-    return f"{int(round(mb)):03d}M"
+    kb = max(float(value), 0.0) / 1024
+    if kb < 1:
+        return " 0K"
+    if kb < 100:
+        return f"{int(kb):2d}K"
+    if kb < 1000:
+        return f"{int(kb // 100):1d}00"
+
+    mb = kb / 1024
+    if mb < 10:
+        return f" {int(mb)}M"
+    if mb < 100:
+        return f"{int(mb):2d}M"
+
+    gb = mb / 1024
+    if gb < 10:
+        return f" {int(gb)}G"
+    return f"{min(int(gb), 99):2d}G"
 
 
 def get_metric_templates(metric_formats: dict, default_metric_formats: dict, metric_name: str) -> list[str]:
