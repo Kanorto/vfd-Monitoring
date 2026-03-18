@@ -1,0 +1,181 @@
+import serial
+import serial.tools.list_ports
+import psutil
+import time
+import wmi
+import json
+import os
+import sys
+import keyboard
+import win32api
+import ctypes
+from py3nvml import py3nvml as nvml
+
+# --- CONFIG ---
+BAUD = 9600
+CLR = b'\x0c'
+HOME = b'\x0b'
+INIT_RUS = b'\x1b\x74\x07'
+CONFIG_NAME = "vfd_config.json"
+
+def get_base_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+os.chdir(get_base_path())
+CONFIG_PATH = os.path.join(get_base_path(), CONFIG_NAME)
+
+is_display_on = True
+update_intervals = [1.0, 5.0, 0.5]
+current_interval_idx = 0
+ser = None
+
+def is_admin():
+    try: return ctypes.windll.shell32.IsUserAnAdmin()
+    except: return False
+
+def load_config():
+    defaults = {"hotkey_toggle": "ctrl+shift+d", "hotkey_speed": "ctrl+shift+s"}
+    cfg = defaults.copy()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                user_cfg = json.load(f)
+                for k, v in user_cfg.items(): cfg[k] = v
+        except: pass
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=4)
+    return cfg
+
+def toggle_display():
+    global is_display_on, ser
+    is_display_on = not is_display_on
+    if not is_display_on and ser:
+        try: ser.write(CLR)
+        except: pass
+
+def change_speed():
+    global current_interval_idx
+    current_interval_idx = (current_interval_idx + 1) % len(update_intervals)
+
+def cleanup_and_exit(*args):
+    global ser
+    if ser:
+        try:
+            ser.write(HOME + "   ДО ВСТРЕЧИ!    ".encode('cp866'))
+            ser.write(" СИСТЕМА ВЫКЛЮЧЕНА ".encode('cp866'))
+            time.sleep(0.8)
+            ser.write(CLR)
+            ser.close()
+        except: pass
+    sys.exit(0)
+
+def get_cpu_t(wmi_obj):
+    if not wmi_obj: return None
+    try:
+        zones = wmi_obj.MSAcpi_ThermalZoneTemperature()
+        if zones:
+            t = (zones[0].CurrentTemperature / 10.0) - 273.15
+            return min(int(t), 99) if 10 < t < 110 else None
+    except: return None
+
+def get_gpu():
+    try:
+        h = nvml.nvmlDeviceGetHandleByIndex(0)
+        u = nvml.nvmlDeviceGetUtilizationRates(h).gpu
+        t = nvml.nvmlDeviceGetTemperature(h, nvml.NVML_TEMPERATURE_GPU)
+        return min(int(u), 99), min(int(t), 99)
+    except: return None, None
+
+def fmt_v(val):
+    """Строго 3 символа: ' 0K', '99K', ' 1M', '99M'"""
+    kb = val / 1024
+    if kb < 1: return " 0K"
+    if kb < 100: return f"{int(kb):2d}K"
+    if kb < 1000: return f"{int(kb//100):1d}00" # 900
+    mb = kb / 1024
+    if mb < 10: return f" {int(mb)}M"
+    return f"{min(int(mb), 99):2d}M"
+
+def find_vfd():
+    chips = ["Prolific", "USB-to-Serial", "FTDI", "Posiflex", "Atol"]
+    for p in serial.tools.list_ports.comports():
+        desc = (p.description + p.hwid).lower()
+        if any(x.lower() in desc for x in chips): return p.device
+    return None
+
+def run_logic():
+    global ser
+    cfg = load_config()
+    keyboard.add_hotkey(cfg.get("hotkey_toggle", "ctrl+shift+d"), toggle_display)
+    keyboard.add_hotkey(cfg.get("hotkey_speed", "ctrl+shift+s"), change_speed)
+    win32api.SetConsoleCtrlHandler(cleanup_and_exit, True)
+
+    try: nvml.nvmlInit()
+    except: pass
+    
+    wmi_n = None
+    try: wmi_n = wmi.WMI(namespace="root\\wmi")
+    except: pass
+
+    last_n, last_d, last_t = psutil.net_io_counters(), psutil.disk_io_counters(), time.time()
+    
+    while True:
+        if ser is None:
+            port = find_vfd()
+            if port:
+                try:
+                    ser = serial.Serial(port, BAUD, timeout=0.1)
+                    ser.write(INIT_RUS + CLR)
+                except: time.sleep(2); continue
+            else: time.sleep(2); continue
+
+        try:
+            if not is_display_on:
+                time.sleep(0.2); continue
+
+            now = time.time()
+            dt = now - last_t
+            if dt < update_intervals[current_interval_idx]:
+                time.sleep(0.05); continue
+
+            cp, rp = min(int(psutil.cpu_percent()), 99), min(int(psutil.virtual_memory().percent), 99)
+            ct, (gp, gt) = get_cpu_t(wmi_n), get_gpu()
+            
+            n, d = psutil.net_io_counters(), psutil.disk_io_counters()
+            ni, no = (n.bytes_recv - last_n.bytes_recv)/dt, (n.bytes_sent - last_n.bytes_sent)/dt
+            dr, dw = (d.read_bytes - last_d.read_bytes)/dt, (d.write_bytes - last_d.write_bytes)/dt
+            last_n, last_d, last_t = n, d, now
+
+            # --- ЛИНИЯ 1: ЦЕНТРИРОВАННАЯ ---
+            # C99;99C или C99%
+            c_s = f"C{cp:02d}" + (f";{ct:02d}C" if ct else "%")
+            # G99;99C или G99%
+            g_s = ""
+            if gp is not None:
+                g_s = f" G{gp:02d}" + (f";{gt:02d}C" if gt else "%")
+            r_s = f" R{rp:02d}%"
+            
+            line1 = (c_s + g_s + r_s).center(20)
+
+            # --- ЛИНИЯ 2: СКОРОСТИ ---
+            # D:99M/99M N:99K/99K
+            line2 = f"D:{fmt_v(dr)}/{fmt_v(dw)} N:{fmt_v(ni)}/{fmt_v(no)}"
+
+            ser.write(HOME + (line1[:20] + line2[:20]).encode('cp866'))
+
+        except (serial.SerialException, OSError): ser = None
+        except: time.sleep(1)
+
+def main():
+    if not is_admin():
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1)
+        return
+    try: run_logic()
+    except Exception as e:
+        print(f"Error: {e}")
+        input("Press Enter...")
+
+if __name__ == "__main__":
+    main()
