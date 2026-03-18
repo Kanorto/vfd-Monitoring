@@ -27,7 +27,7 @@ from PIL import Image, ImageDraw
 from py3nvml import py3nvml as nvml
 
 # --- НАСТРОЙКИ VFD ---
-APP_VERSION = os.environ.get("VFD_MONITOR_VERSION", "0.2.0")
+APP_VERSION = os.environ.get("VFD_MONITOR_VERSION", "0.3.1")
 BAUD = 9600
 CLR = b'\x0c'
 HOME = b'\x0b'
