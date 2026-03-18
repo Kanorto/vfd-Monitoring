@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import winreg
+from ctypes import Structure, WinDLL, byref, wintypes
 
 import psutil
 import pystray
@@ -55,6 +56,103 @@ UPDATE_ATTEMPTS = 4
 UPDATE_POLL_INTERVAL = 1800
 UPDATE_ALERT_THRESHOLD = 3
 STATUS_FRAMES = ['|', '/', '-', '\\']
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+WM_HOTKEY = 0x0312
+
+DEFAULT_METRIC_FORMATS = {
+    "cpu": [
+        "CPU{usage:02d}% {temp:02d}" + DEG_CHAR,
+        "C{usage:02d} {temp:02d}" + DEG_CHAR,
+        "CPU{usage:02d}%",
+        "C{usage:02d}%",
+        "C{usage:02d}",
+        "CPU{temp:02d}" + DEG_CHAR,
+        "C{temp:02d}" + DEG_CHAR,
+        "C{temp:02d}",
+    ],
+    "gpu": [
+        "GPU{usage:02d}% {temp:02d}" + DEG_CHAR,
+        "G{usage:02d} {temp:02d}" + DEG_CHAR,
+        "GPU{usage:02d}%",
+        "G{usage:02d}%",
+        "G{usage:02d}",
+        "GPU{temp:02d}" + DEG_CHAR,
+        "G{temp:02d}" + DEG_CHAR,
+        "G{temp:02d}",
+    ],
+    "ram": [
+        "RAM{value:02d}%",
+        "R{value:02d}%",
+        "R{value:02d}",
+    ],
+    "disk": [
+        "D:{read}/{write}",
+        "D{read}/{write}",
+    ],
+    "network": [
+        "N:{recv}/{send}",
+        "N{recv}/{send}",
+    ],
+}
+DEFAULT_LINE_SPACING = {
+    "primary": " ",
+    "secondary": " ",
+    "primary_compact": "",
+    "secondary_compact": "",
+}
+DEFAULT_HOTKEYS = {
+    "toggle_display": "Ctrl+Alt+D",
+    "check_updates": "Ctrl+Alt+U",
+    "show_changelog": "Ctrl+Alt+C",
+}
+HOTKEY_LABELS = {
+    "toggle_display": "Вкл/выкл дисплей",
+    "check_updates": "Проверить обновления",
+    "show_changelog": "Показать changelog",
+}
+HOTKEY_CALLBACKS = {}
+MODIFIER_ALIASES = {
+    "CTRL": "Ctrl",
+    "CONTROL": "Ctrl",
+    "ALT": "Alt",
+    "SHIFT": "Shift",
+    "WIN": "Win",
+    "WINDOWS": "Win",
+}
+VK_NAME_MAP = {
+    "SPACE": 0x20,
+    "TAB": 0x09,
+    "ENTER": 0x0D,
+    "RETURN": 0x0D,
+    "ESC": 0x1B,
+    "ESCAPE": 0x1B,
+    "BACKSPACE": 0x08,
+    "DELETE": 0x2E,
+    "DEL": 0x2E,
+    "INSERT": 0x2D,
+    "INS": 0x2D,
+    "HOME": 0x24,
+    "END": 0x23,
+    "PAGEUP": 0x21,
+    "PRIOR": 0x21,
+    "PAGEDOWN": 0x22,
+    "NEXT": 0x22,
+    "LEFT": 0x25,
+    "UP": 0x26,
+    "RIGHT": 0x27,
+    "DOWN": 0x28,
+    "PLUS": 0xBB,
+    "MINUS": 0xBD,
+}
+for index in range(1, 25):
+    VK_NAME_MAP[f"F{index}"] = 0x6F + index
+for digit in "0123456789":
+    VK_NAME_MAP[digit] = ord(digit)
+for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    VK_NAME_MAP[letter] = ord(letter)
 
 
 def get_base_path():
@@ -90,6 +188,7 @@ manual_update_feedback = {
     "details": "",
 }
 update_alert_lock = threading.Lock()
+hotkey_manager = None
 
 
 def ensure_dir(path):
@@ -97,6 +196,84 @@ def ensure_dir(path):
 
 
 ensure_dir(UPDATES_DIR)
+
+
+def deep_merge(base, updates):
+    result = {}
+    for key, value in base.items():
+        if isinstance(value, dict):
+            incoming = updates.get(key, {}) if isinstance(updates.get(key), dict) else {}
+            result[key] = deep_merge(value, incoming)
+        elif isinstance(value, list):
+            incoming = updates.get(key)
+            result[key] = incoming if isinstance(incoming, list) and incoming else list(value)
+        else:
+            result[key] = updates.get(key, value)
+    for key, value in updates.items():
+        if key not in result:
+            result[key] = value
+    return result
+
+
+def coerce_text(value, fallback):
+    if value is None:
+        return fallback
+    return str(value)
+
+
+def sanitize_spacing(spacing):
+    data = deep_merge(DEFAULT_LINE_SPACING, spacing if isinstance(spacing, dict) else {})
+    for key, fallback in DEFAULT_LINE_SPACING.items():
+        data[key] = coerce_text(data.get(key), fallback)
+    return data
+
+
+def sanitize_metric_formats(formats):
+    raw_formats = formats if isinstance(formats, dict) else {}
+    result = {}
+    for key, defaults in DEFAULT_METRIC_FORMATS.items():
+        user_value = raw_formats.get(key)
+        if isinstance(user_value, list):
+            cleaned = [str(item) for item in user_value if str(item).strip()]
+            result[key] = cleaned or list(defaults)
+        else:
+            result[key] = list(defaults)
+    return result
+
+
+def canonicalize_hotkey(value):
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    parts = [part.strip() for part in text.replace('-', '+').split('+') if part.strip()]
+    if not parts:
+        return ''
+
+    modifiers = []
+    key = ''
+    for part in parts:
+        upper = part.upper()
+        modifier = MODIFIER_ALIASES.get(upper)
+        if modifier:
+            if modifier not in modifiers:
+                modifiers.append(modifier)
+            continue
+        if len(upper) == 1 and upper.isalpha():
+            key = upper
+        else:
+            key = upper.title() if upper.startswith('F') and upper[1:].isdigit() else upper
+    if not key:
+        return '+'.join(modifiers)
+    ordered_modifiers = [name for name in ['Ctrl', 'Alt', 'Shift', 'Win'] if name in modifiers]
+    return '+'.join(ordered_modifiers + [key])
+
+
+def sanitize_hotkeys(hotkeys):
+    raw_hotkeys = hotkeys if isinstance(hotkeys, dict) else {}
+    result = {}
+    for action, default in DEFAULT_HOTKEYS.items():
+        result[action] = canonicalize_hotkey(raw_hotkeys.get(action, default))
+    return result
 
 
 def load_config():
@@ -124,6 +301,10 @@ def load_config():
         "update_failure_count": 0,
         "last_alerted_version": "",
         "update_channel": "release",
+        "metric_formats": DEFAULT_METRIC_FORMATS,
+        "line_spacing": DEFAULT_LINE_SPACING,
+        "hotkeys_enabled": True,
+        "hotkeys": DEFAULT_HOTKEYS,
     }
     legacy_key_map = {
         "show_gpu": "show_gpu_usage",
@@ -139,6 +320,10 @@ def load_config():
                     cfg[mapped_key] = value
         except Exception as e:
             logging.error(f"Ошибка чтения конфига: {e}")
+    cfg["metric_formats"] = sanitize_metric_formats(cfg.get("metric_formats"))
+    cfg["line_spacing"] = sanitize_spacing(cfg.get("line_spacing"))
+    cfg["hotkeys"] = sanitize_hotkeys(cfg.get("hotkeys"))
+    cfg["hotkeys_enabled"] = bool(cfg.get("hotkeys_enabled", True))
     with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
         json.dump(cfg, file, indent=4, ensure_ascii=False)
     return cfg
@@ -150,6 +335,10 @@ current_interval = cfg.get("update_interval", 1.0)
 
 def save_config(config):
     try:
+        config["metric_formats"] = sanitize_metric_formats(config.get("metric_formats"))
+        config["line_spacing"] = sanitize_spacing(config.get("line_spacing"))
+        config["hotkeys"] = sanitize_hotkeys(config.get("hotkeys"))
+        config["hotkeys_enabled"] = bool(config.get("hotkeys_enabled", True))
         with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
             json.dump(config, file, indent=4, ensure_ascii=False)
     except Exception as e:
@@ -291,6 +480,8 @@ def show_farewell():
 def cleanup_and_exit(event):
     global app_running
     app_running = False
+    if hotkey_manager is not None:
+        hotkey_manager.stop()
     show_farewell()
     return True
 
@@ -792,6 +983,337 @@ def manual_check_updates(icon=None, item=None):
     threading.Thread(target=worker, daemon=True).start()
 
 
+class POINT(Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class MSG(Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", POINT),
+        ("lPrivate", wintypes.DWORD),
+    ]
+
+
+user32 = WinDLL('user32', use_last_error=True)
+kernel32 = WinDLL('kernel32', use_last_error=True)
+
+
+def parse_hotkey(hotkey_text):
+    hotkey = canonicalize_hotkey(hotkey_text)
+    if not hotkey:
+        return None
+
+    parts = hotkey.split('+')
+    modifiers = 0
+    key_part = ''
+    for part in parts:
+        upper = part.upper()
+        if upper == 'CTRL':
+            modifiers |= MOD_CONTROL
+        elif upper == 'ALT':
+            modifiers |= MOD_ALT
+        elif upper == 'SHIFT':
+            modifiers |= MOD_SHIFT
+        elif upper == 'WIN':
+            modifiers |= MOD_WIN
+        else:
+            key_part = upper
+
+    if not key_part:
+        return None
+
+    vk = VK_NAME_MAP.get(key_part.upper())
+    if vk is None:
+        return None
+    return modifiers, vk, hotkey
+
+
+def format_hotkey_preview(value):
+    return canonicalize_hotkey(value) or 'Не назначено'
+
+
+class HotkeyManager:
+    def __init__(self):
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.thread_id = None
+        self.registered = {}
+        self.lock = threading.Lock()
+
+    def start(self):
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            self.stop_event.set()
+            if self.thread_id:
+                user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)
+            thread = self.thread
+        if thread:
+            thread.join(timeout=2)
+        with self.lock:
+            self.thread = None
+            self.thread_id = None
+            self.registered = {}
+
+    def reload(self):
+        self.stop()
+        self.start()
+
+    def _unregister_all(self):
+        for hotkey_id in list(self.registered):
+            try:
+                user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        self.registered = {}
+
+    def _register_configured_hotkeys(self):
+        self._unregister_all()
+        if not cfg.get("hotkeys_enabled", True):
+            logging.info("Горячие клавиши отключены в конфиге")
+            return
+
+        hotkeys = cfg.get("hotkeys", {})
+        used = {}
+        next_hotkey_id = 1
+        for action, callback in HOTKEY_CALLBACKS.items():
+            parsed = parse_hotkey(hotkeys.get(action, ''))
+            if not parsed:
+                logging.warning("Горячая клавиша для действия '%s' не задана или некорректна", action)
+                continue
+            modifiers, vk, normalized = parsed
+            key_signature = (modifiers, vk)
+            if key_signature in used:
+                logging.warning(
+                    "Горячая клавиша %s уже назначена для '%s', действие '%s' пропущено",
+                    normalized,
+                    used[key_signature],
+                    action,
+                )
+                continue
+            if not user32.RegisterHotKey(None, next_hotkey_id, modifiers, vk):
+                logging.warning("Не удалось зарегистрировать горячую клавишу %s", normalized)
+                continue
+            self.registered[next_hotkey_id] = callback
+            used[key_signature] = action
+            next_hotkey_id += 1
+
+    def _run(self):
+        self.thread_id = kernel32.GetCurrentThreadId()
+        self._register_configured_hotkeys()
+        msg = MSG()
+        while not self.stop_event.is_set():
+            result = user32.GetMessageW(byref(msg), None, 0, 0)
+            if result <= 0:
+                break
+            if msg.message == WM_HOTKEY:
+                callback = self.registered.get(int(msg.wParam))
+                if callback:
+                    threading.Thread(target=callback, daemon=True).start()
+            user32.TranslateMessage(byref(msg))
+            user32.DispatchMessageW(byref(msg))
+        self._unregister_all()
+
+
+def execute_hotkey_toggle_display():
+    toggle_display(None, None)
+
+
+def execute_hotkey_check_updates():
+    manual_check_updates(None, None)
+
+
+def execute_hotkey_show_changelog():
+    open_changelog_window(None, None)
+
+
+HOTKEY_CALLBACKS.update({
+    "toggle_display": execute_hotkey_toggle_display,
+    "check_updates": execute_hotkey_check_updates,
+    "show_changelog": execute_hotkey_show_changelog,
+})
+
+
+def reload_hotkeys():
+    if hotkey_manager is not None:
+        hotkey_manager.reload()
+    refresh_menu()
+
+
+def open_config_file(icon=None, item=None):
+    try:
+        os.startfile(CONFIG_PATH)
+    except Exception:
+        pass
+
+
+def toggle_hotkeys(icon, item):
+    cfg["hotkeys_enabled"] = not cfg.get("hotkeys_enabled", True)
+    save_config(cfg)
+    reload_hotkeys()
+    refresh_menu(icon)
+
+
+def open_hotkeys_settings(icon=None, item=None):
+    def worker():
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+
+        root = tk.Tk()
+        root.title("Горячие клавиши VFD Monitor")
+        root.attributes('-topmost', True)
+        root.resizable(False, False)
+
+        state_var = tk.BooleanVar(value=cfg.get("hotkeys_enabled", True))
+        value_vars = {
+            action: tk.StringVar(value=format_hotkey_preview(cfg.get("hotkeys", {}).get(action, '')))
+            for action in DEFAULT_HOTKEYS
+        }
+        local_hotkeys = dict(cfg.get("hotkeys", {}))
+
+        pressed_modifiers = set()
+        capture_window = {"value": None}
+
+        def normalize_combo(modifiers, key_name):
+            ordered = [name for name in ["Ctrl", "Alt", "Shift", "Win"] if name in modifiers]
+            return '+'.join(ordered + [key_name]) if key_name else '+'.join(ordered)
+
+        def start_capture(action):
+            if capture_window["value"] is not None:
+                capture_window["value"].destroy()
+
+            pressed_modifiers.clear()
+            dialog = tk.Toplevel(root)
+            dialog.title(f"Запись: {HOTKEY_LABELS[action]}")
+            dialog.attributes('-topmost', True)
+            dialog.resizable(False, False)
+            dialog.grab_set()
+            capture_window["value"] = dialog
+
+            def close_capture():
+                capture_window["value"] = None
+                dialog.destroy()
+
+            hint_var = tk.StringVar(value="Нажмите комбинацию, затем отпустите клавиши.")
+            ttk.Label(dialog, text=HOTKEY_LABELS[action], font=('Segoe UI', 10, 'bold')).pack(padx=16, pady=(12, 8))
+            ttk.Label(dialog, textvariable=hint_var, width=40, anchor='center').pack(padx=16, pady=(0, 12))
+
+            def on_press(event):
+                key = event.keysym.lower()
+                if key in ('control_l', 'control_r'):
+                    pressed_modifiers.add('Ctrl')
+                    hint_var.set(normalize_combo(pressed_modifiers, ''))
+                    return
+                if key in ('alt_l', 'alt_r', 'meta_l', 'meta_r'):
+                    pressed_modifiers.add('Alt')
+                    hint_var.set(normalize_combo(pressed_modifiers, ''))
+                    return
+                if key in ('shift_l', 'shift_r'):
+                    pressed_modifiers.add('Shift')
+                    hint_var.set(normalize_combo(pressed_modifiers, ''))
+                    return
+                if key in ('super_l', 'super_r', 'win_l', 'win_r'):
+                    pressed_modifiers.add('Win')
+                    hint_var.set(normalize_combo(pressed_modifiers, ''))
+                    return
+
+                key_name = event.keysym.upper() if len(event.keysym) == 1 else event.keysym.replace('_', '').upper()
+                combo = canonicalize_hotkey(normalize_combo(pressed_modifiers, key_name))
+                if combo:
+                    local_hotkeys[action] = combo
+                    value_vars[action].set(combo)
+                    close_capture()
+
+            def on_release(event):
+                key = event.keysym.lower()
+                if key in ('control_l', 'control_r'):
+                    pressed_modifiers.discard('Ctrl')
+                elif key in ('alt_l', 'alt_r', 'meta_l', 'meta_r'):
+                    pressed_modifiers.discard('Alt')
+                elif key in ('shift_l', 'shift_r'):
+                    pressed_modifiers.discard('Shift')
+                elif key in ('super_l', 'super_r', 'win_l', 'win_r'):
+                    pressed_modifiers.discard('Win')
+
+            dialog.bind('<KeyPress>', on_press)
+            dialog.bind('<KeyRelease>', on_release)
+            dialog.bind('<Escape>', lambda event: close_capture())
+            dialog.protocol("WM_DELETE_WINDOW", close_capture)
+            dialog.focus_force()
+
+        frame = ttk.Frame(root, padding=14)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Checkbutton(frame, text='Включить глобальные горячие клавиши', variable=state_var).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 12))
+
+        row = 1
+        for action, label in HOTKEY_LABELS.items():
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=4)
+            ttk.Entry(frame, textvariable=value_vars[action], state='readonly', width=24).grid(row=row, column=1, sticky='ew', pady=4)
+            button_frame = ttk.Frame(frame)
+            button_frame.grid(row=row, column=2, sticky='e', pady=4)
+            ttk.Button(button_frame, text='Записать', command=lambda action_name=action: start_capture(action_name)).pack(side='left', padx=(0, 6))
+            ttk.Button(
+                button_frame,
+                text='Очистить',
+                command=lambda action_name=action: (local_hotkeys.__setitem__(action_name, ''), value_vars[action_name].set('Не назначено')),
+            ).pack(side='left')
+            row += 1
+
+        ttk.Label(
+            frame,
+            text="Шаблоны форматирования и отступы редактируются в vfd_config.json\nразделами metric_formats и line_spacing.",
+            justify='left',
+        ).grid(row=row, column=0, columnspan=3, sticky='w', pady=(12, 10))
+        row += 1
+
+        button_bar = ttk.Frame(frame)
+        button_bar.grid(row=row, column=0, columnspan=3, sticky='e')
+        ttk.Button(button_bar, text='Открыть конфиг', command=open_config_file).pack(side='left', padx=(0, 8))
+
+        def save_and_close():
+            normalized = sanitize_hotkeys(local_hotkeys)
+            duplicates = {}
+            for action, hotkey_value in normalized.items():
+                if not hotkey_value:
+                    continue
+                if hotkey_value in duplicates:
+                    messagebox.showerror(
+                        "Повтор клавиш",
+                        f"Комбинация {hotkey_value} уже назначена для '{HOTKEY_LABELS[duplicates[hotkey_value]]}'.",
+                        parent=root,
+                    )
+                    return
+                if parse_hotkey(hotkey_value) is None:
+                    messagebox.showerror("Ошибка", f"Комбинация {hotkey_value} не поддерживается.", parent=root)
+                    return
+                duplicates[hotkey_value] = action
+            cfg["hotkeys_enabled"] = bool(state_var.get())
+            cfg["hotkeys"] = normalized
+            save_config(cfg)
+            reload_hotkeys()
+            root.destroy()
+
+        ttk.Button(button_bar, text='Сохранить', command=save_and_close).pack(side='left', padx=(0, 8))
+        ttk.Button(button_bar, text='Отмена', command=root.destroy).pack(side='left')
+
+        frame.columnconfigure(1, weight=1)
+        root.mainloop()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 # --- ИНТЕРФЕЙС И ТРЕЙ ---
 def toggle_autostart(icon, item):
     cfg["autostart"] = not cfg["autostart"]
@@ -894,6 +1416,8 @@ def install_update_and_exit(icon=None, item=None):
         show_temporary_message('ОБНОВЛЕНИЕ', 'НЕТ СКАЧАННОГО', duration=3)
         return
     app_running = False
+    if hotkey_manager is not None:
+        hotkey_manager.stop()
     if tray_icon is not None:
         tray_icon.stop()
     schedule_pending_update_install()
@@ -905,6 +1429,8 @@ def install_update_and_exit(icon=None, item=None):
 def exit_app(icon, item):
     global app_running
     app_running = False
+    if hotkey_manager is not None:
+        hotkey_manager.stop()
     if cfg.get('pending_update_path') and os.path.exists(cfg.get('pending_update_path', '')):
         schedule_pending_update_install()
     icon.stop()
@@ -973,33 +1499,62 @@ def find_vfd():
 
 
 
-def build_usage_options(full_prefix, short_prefix, percent, temp, show_usage, show_temp):
+def get_metric_templates(metric_name):
+    metric_formats = cfg.get("metric_formats", {})
+    templates = metric_formats.get(metric_name)
+    if isinstance(templates, list) and templates:
+        return templates
+    return list(DEFAULT_METRIC_FORMATS[metric_name])
+
+
+def apply_template(template, **kwargs):
+    try:
+        return str(template).format(**kwargs)
+    except Exception as exc:
+        logging.warning("Некорректный шаблон '%s': %s", template, exc)
+        return ''
+
+
+def build_usage_options(metric_name, full_prefix, short_prefix, percent, temp, show_usage, show_temp):
     options = []
+    templates = get_metric_templates(metric_name)
+    values = {
+        "usage": percent if percent is not None else 0,
+        "temp": temp if temp is not None else 0,
+        "full_prefix": full_prefix,
+        "short_prefix": short_prefix,
+        "degree": DEG_CHAR,
+    }
     if show_usage and percent is not None and show_temp and temp is not None:
-        options.append(f"{full_prefix}{percent:02d}% {temp:02d}{DEG_CHAR}")
-        options.append(f"{short_prefix}{percent:02d} {temp:02d}{DEG_CHAR}")
-        options.append(f"{full_prefix}{percent:02d}%")
-        options.append(f"{short_prefix}{percent:02d}%")
-        options.append(f"{short_prefix}{percent:02d}")
+        for template in templates:
+            rendered = apply_template(template, **values)
+            if rendered and rendered not in options:
+                options.append(rendered)
     elif show_usage and percent is not None:
-        options.append(f"{full_prefix}{percent:02d}%")
-        options.append(f"{short_prefix}{percent:02d}%")
-        options.append(f"{short_prefix}{percent:02d}")
+        for template in templates:
+            if '{temp' in str(template):
+                continue
+            rendered = apply_template(template, **values)
+            if rendered and rendered not in options:
+                options.append(rendered)
     elif show_temp and temp is not None:
-        options.append(f"{full_prefix}{temp:02d}{DEG_CHAR}")
-        options.append(f"{short_prefix}{temp:02d}{DEG_CHAR}")
-        options.append(f"{short_prefix}{temp:02d}")
+        for template in templates:
+            if '{usage' in str(template):
+                continue
+            rendered = apply_template(template, **values)
+            if rendered and rendered not in options:
+                options.append(rendered)
     return options
 
 
 
-def render_segments(segment_options, width=LINE_WIDTH):
+def render_segments(segment_options, width=LINE_WIDTH, separator=' ', compact_separator=''):
     if not segment_options:
         return fit_text('', width, align='center')
 
     indexes = [0] * len(segment_options)
     while True:
-        text = ' '.join(options[index] for options, index in zip(segment_options, indexes))
+        text = separator.join(options[index] for options, index in zip(segment_options, indexes))
         if len(text) <= width:
             return fit_text(text, width, align='center')
 
@@ -1016,7 +1571,7 @@ def render_segments(segment_options, width=LINE_WIDTH):
                 candidate = idx
 
         if candidate is None:
-            compact = ''.join(options[-1] for options in segment_options)
+            compact = compact_separator.join(options[-1] for options in segment_options)
             return fit_text(compact, width, align='center')
 
         indexes[candidate] += 1
@@ -1026,6 +1581,7 @@ def render_segments(segment_options, width=LINE_WIDTH):
 def build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent):
     segments = []
     cpu_options = build_usage_options(
+        'cpu',
         'CPU',
         'C',
         cpu_percent,
@@ -1037,6 +1593,7 @@ def build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_per
         segments.append(cpu_options)
 
     gpu_options = build_usage_options(
+        'gpu',
         'GPU',
         'G',
         gpu_percent,
@@ -1048,7 +1605,13 @@ def build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_per
         segments.append(gpu_options)
 
     if cfg.get("show_ram", True):
-        segments.append([f"RAM{ram_percent:02d}%", f"R{ram_percent:02d}%", f"R{ram_percent:02d}"])
+        ram_options = []
+        for template in get_metric_templates("ram"):
+            rendered = apply_template(template, value=ram_percent)
+            if rendered and rendered not in ram_options:
+                ram_options.append(rendered)
+        if ram_options:
+            segments.append(ram_options)
     return segments
 
 
@@ -1056,26 +1619,42 @@ def build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_per
 def build_io_segments(disk_read, disk_write, net_in, net_out):
     segments = []
     if cfg.get("show_disk", True):
-        segments.append([
-            f"D:{fmt_v(disk_read)}/{fmt_v(disk_write)}",
-            f"D{fmt_v(disk_read)}/{fmt_v(disk_write)}",
-        ])
+        disk_options = []
+        for template in get_metric_templates("disk"):
+            rendered = apply_template(template, read=fmt_v(disk_read), write=fmt_v(disk_write))
+            if rendered and rendered not in disk_options:
+                disk_options.append(rendered)
+        if disk_options:
+            segments.append(disk_options)
     if cfg.get("show_network", True):
-        segments.append([
-            f"N:{fmt_v(net_in)}/{fmt_v(net_out)}",
-            f"N{fmt_v(net_in)}/{fmt_v(net_out)}",
-        ])
+        network_options = []
+        for template in get_metric_templates("network"):
+            rendered = apply_template(template, recv=fmt_v(net_in), send=fmt_v(net_out))
+            if rendered and rendered not in network_options:
+                network_options.append(rendered)
+        if network_options:
+            segments.append(network_options)
     return segments
 
 
 
 def build_line1(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent):
-    return render_segments(build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent))
+    spacing = cfg.get("line_spacing", DEFAULT_LINE_SPACING)
+    return render_segments(
+        build_primary_segments(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent),
+        separator=spacing.get("primary", " "),
+        compact_separator=spacing.get("primary_compact", ""),
+    )
 
 
 
 def build_line2(disk_read, disk_write, net_in, net_out):
-    return render_segments(build_io_segments(disk_read, disk_write, net_in, net_out))
+    spacing = cfg.get("line_spacing", DEFAULT_LINE_SPACING)
+    return render_segments(
+        build_io_segments(disk_read, disk_write, net_in, net_out),
+        separator=spacing.get("secondary", " "),
+        compact_separator=spacing.get("secondary_compact", ""),
+    )
 
 
 
@@ -1210,9 +1789,16 @@ def build_updates_submenu():
     )
 
 
+def build_hotkeys_submenu():
+    return pystray.Menu(
+        pystray.MenuItem('Включить горячие клавиши', toggle_hotkeys, checked=lambda item: cfg.get("hotkeys_enabled", True)),
+        pystray.MenuItem('Настроить клавиши...', open_hotkeys_settings),
+    )
+
+
 
 def main():
-    global tray_icon
+    global tray_icon, hotkey_manager
 
     if apply_pending_update_on_startup():
         return
@@ -1225,6 +1811,9 @@ def main():
     updater = threading.Thread(target=update_worker_loop, daemon=True)
     updater.start()
 
+    hotkey_manager = HotkeyManager()
+    hotkey_manager.start()
+
     speed_submenu = pystray.Menu(
         pystray.MenuItem('0.5 сек', make_speed_setter(0.5), radio=True, checked=lambda item: current_interval == 0.5),
         pystray.MenuItem('1.0 сек (Стандарт)', make_speed_setter(1.0), radio=True, checked=lambda item: current_interval == 1.0),
@@ -1236,8 +1825,10 @@ def main():
         pystray.MenuItem('Вкл/Выкл дисплей', toggle_display),
         pystray.MenuItem('Что показывать', build_metrics_submenu()),
         pystray.MenuItem('Скорость обновления', speed_submenu),
+        pystray.MenuItem('Горячие клавиши', build_hotkeys_submenu()),
         pystray.MenuItem('Обновления', build_updates_submenu()),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Открыть конфиг', open_config_file),
         pystray.MenuItem('Открыть логи', open_logs),
         pystray.MenuItem('Автозапуск с Windows', toggle_autostart, checked=lambda item: cfg.get("autostart", False)),
         pystray.Menu.SEPARATOR,
