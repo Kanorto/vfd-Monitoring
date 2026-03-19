@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 
-APP_NAME = "VFD PC Monitor v1.0.2"
+APP_NAME = "VFD PC Monitor v1.1.0"
 ENTRYPOINT = "vfd_monitor.py"
 SUPPORTED_PYTHON = (3, 11)
 
