@@ -196,22 +196,49 @@ def build_primary_segments(cfg: dict, default_metric_formats: dict, cpu_percent,
     return segments
 
 
+def _add_unique(options: list[str], value: str):
+    if value and value not in options:
+        options.append(value)
+
+
+
+def expand_io_variants(rendered: str, full_label: str, short_label: str) -> list[str]:
+    text = str(rendered or '')
+    if not text:
+        return []
+    variants = []
+    lowered = text.lower()
+    if lowered.startswith(full_label):
+        _add_unique(variants, text)
+        suffix = text[len(full_label):]
+        _add_unique(variants, short_label + suffix)
+        return variants
+    if lowered.startswith(short_label):
+        suffix = text[len(short_label):]
+        _add_unique(variants, full_label + suffix)
+        _add_unique(variants, text)
+        return variants
+    _add_unique(variants, text)
+    return variants
+
+
+
 def build_io_segments(cfg: dict, default_metric_formats: dict, disk_read, disk_write, net_in, net_out) -> list[list[str]]:
     segments = []
     if cfg.get("show_disk", True):
         disk_options = []
         for template in get_metric_templates(cfg.get("metric_formats", {}), default_metric_formats, "disk"):
             rendered = apply_template(template, read=fmt_v(disk_read), write=fmt_v(disk_write))
-            if rendered and rendered not in disk_options:
-                disk_options.append(rendered)
+            for candidate in expand_io_variants(rendered, 'disk', 'd'):
+                _add_unique(disk_options, candidate)
         if disk_options:
             segments.append(disk_options)
     if cfg.get("show_network", True):
         network_options = []
         for template in get_metric_templates(cfg.get("metric_formats", {}), default_metric_formats, "network"):
             rendered = apply_template(template, recv=fmt_v(net_in), send=fmt_v(net_out))
-            if rendered and rendered not in network_options:
-                network_options.append(rendered)
+            for candidate in expand_io_variants(rendered, 'net', 'n'):
+                _add_unique(network_options, candidate)
         if network_options:
             segments.append(network_options)
     return segments
