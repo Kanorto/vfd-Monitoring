@@ -28,6 +28,9 @@ from py3nvml import py3nvml as nvml
 
 import app_hotkeys
 import vfd_display
+from alerts_engine import DEFAULT_STATE as ALERTS_DEFAULT_STATE, TelegramAlertManager, build_alert_from_telegram_message
+from alerts_gui import open_alerts_window
+from metrics_engine import RuntimeMetricsSampler
 from notes_engine import DEFAULT_STATE as NOTES_DEFAULT_STATE, NotesReminderManager
 from notes_gui import open_notes_reminders_window
 
@@ -53,6 +56,10 @@ DISPLAY_FLAGS = {
     "show_disk": "Диск",
     "show_network": "Сеть",
 }
+TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
+TELEGRAM_LONG_POLL_TIMEOUT = 25
+TELEGRAM_REQUEST_TIMEOUT = TELEGRAM_LONG_POLL_TIMEOUT + 10
+METRICS_SAMPLE_INTERVAL = 1.0
 DEFAULT_REPOSITORY = os.environ.get("VFD_MONITOR_GITHUB_REPO", "Kanorto/vfd-Monitoring")
 UPDATE_API_BASE = "https://api.github.com/repos/{repo}/releases/latest"
 UPDATE_HISTORY_API_BASE = "https://api.github.com/repos/{repo}/releases?per_page={limit}"
@@ -96,12 +103,16 @@ DEFAULT_METRIC_FORMATS = {
         "R{value:02d}",
     ],
     "disk": [
-        "D:{read}/{write}",
-        "D{read}/{write}",
+        "disk:{read}/{write}",
+        "d:{read}/{write}",
+        "disk{read}/{write}",
+        "d{read}/{write}",
     ],
     "network": [
-        "N:{recv}/{send}",
-        "N{recv}/{send}",
+        "net:{recv}/{send}",
+        "n:{recv}/{send}",
+        "net{recv}/{send}",
+        "n{recv}/{send}",
     ],
 }
 DEFAULT_LINE_SPACING = {
@@ -190,6 +201,10 @@ update_alert_lock = threading.Lock()
 hotkey_manager = None
 notes_manager = None
 sensor_cache_lock = threading.Lock()
+telegram_poll_state_lock = threading.Lock()
+telegram_poll_state = {
+    "announced_waiting": False,
+}
 sensor_runtime_cache = {
     "nvidia_smi": {
         "timestamp": 0.0,
@@ -314,6 +329,7 @@ def load_config():
         "hotkeys_enabled": True,
         "hotkeys": DEFAULT_HOTKEYS,
         "notes_reminders": NOTES_DEFAULT_STATE["notes_reminders"],
+        "telegram_alerts": ALERTS_DEFAULT_STATE["telegram_alerts"],
     }
     legacy_key_map = {
         "show_gpu": "show_gpu_usage",
@@ -335,6 +351,8 @@ def load_config():
     cfg["hotkeys_enabled"] = bool(cfg.get("hotkeys_enabled", True))
     if not isinstance(cfg.get("notes_reminders"), dict):
         cfg["notes_reminders"] = NOTES_DEFAULT_STATE["notes_reminders"]
+    if not isinstance(cfg.get("telegram_alerts"), dict):
+        cfg["telegram_alerts"] = ALERTS_DEFAULT_STATE["telegram_alerts"]
     with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
         json.dump(cfg, file, indent=4, ensure_ascii=False)
     return cfg
@@ -352,6 +370,8 @@ def save_config(config):
         config["hotkeys_enabled"] = bool(config.get("hotkeys_enabled", True))
         if not isinstance(config.get("notes_reminders"), dict):
             config["notes_reminders"] = NOTES_DEFAULT_STATE["notes_reminders"]
+        if not isinstance(config.get("telegram_alerts"), dict):
+            config["telegram_alerts"] = ALERTS_DEFAULT_STATE["telegram_alerts"]
         with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
             json.dump(config, file, indent=4, ensure_ascii=False)
     except Exception as e:
@@ -417,9 +437,30 @@ def fit_text(text, width=LINE_WIDTH, align='left'):
 
 
 notes_manager = NotesReminderManager(lambda: cfg, save_config, width_fn=get_vfd_char_width, width=LINE_WIDTH)
+alert_manager = TelegramAlertManager(lambda: cfg, save_config, width_fn=get_vfd_char_width, width=LINE_WIDTH)
+
+
+def set_notes_overlay_suspended(suspended: bool):
+    if notes_manager is None:
+        return
+    try:
+        notes_manager.set_suspended(suspended)
+    except Exception as exc:
+        logging.error(f"Ошибка смены паузы overlay-менеджера: {exc}")
+
 
 
 def get_active_overlay_item():
+    if alert_manager is not None:
+        try:
+            active_alert = alert_manager.get_current_display()
+            if active_alert is not None:
+                set_notes_overlay_suspended(True)
+                return active_alert
+        except Exception as exc:
+            logging.error(f"Ошибка alert-менеджера: {exc}")
+
+    set_notes_overlay_suspended(False)
     if notes_manager is None:
         return None
     try:
@@ -437,7 +478,19 @@ def show_reminders_window(icon=None, item=None):
     open_notes_reminders_window(notes_manager, initial_tab='reminders', on_refresh=refresh_menu)
 
 
+def show_alerts_window(icon=None, item=None):
+    open_alerts_window(alert_manager, on_refresh=refresh_menu)
+
+
 def cycle_overlay_item(direction):
+    if alert_manager is not None:
+        item = alert_manager.manual_cycle(direction)
+        if item is not None:
+            preview = (item.get('author_name') or item.get('text') or '')[:LINE_WIDTH]
+            if preview:
+                show_temporary_message('ALERT', preview, duration=1.2)
+            refresh_menu()
+            return
     if notes_manager is None:
         return
     item = notes_manager.manual_cycle(direction)
@@ -452,6 +505,11 @@ def hide_active_overlay_item():
     active = get_active_overlay_item()
     if active is None:
         return
+    if hasattr(active, 'alert_id'):
+        alert_manager.dismiss_alert(active.alert_id, 'hidden')
+        show_temporary_message('СКРЫТО', active.title[:LINE_WIDTH], duration=1.5)
+        refresh_menu()
+        return
     notes_manager.mark_item(active.kind, active.item_id, 'hide')
     show_temporary_message('СКРЫТО', active.title[:LINE_WIDTH], duration=1.5)
     refresh_menu()
@@ -460,6 +518,11 @@ def hide_active_overlay_item():
 def complete_active_overlay_item():
     active = get_active_overlay_item()
     if active is None:
+        return
+    if hasattr(active, 'alert_id'):
+        alert_manager.dismiss_alert(active.alert_id, 'done')
+        show_temporary_message('ВЫПОЛНЕНО', active.title[:LINE_WIDTH], duration=1.5)
+        refresh_menu()
         return
     notes_manager.mark_item(active.kind, active.item_id, 'done')
     show_temporary_message('ВЫПОЛНЕНО', active.title[:LINE_WIDTH], duration=1.5)
@@ -1479,6 +1542,132 @@ def open_hotkeys_settings(icon=None, item=None):
     )
 
 
+def telegram_api_request(method, params=None, timeout=TELEGRAM_REQUEST_TIMEOUT):
+    token = (alert_manager.get_state_snapshot().get('bot_token') if alert_manager is not None else '') or ''
+    if not token:
+        raise RuntimeError('Не задан token Telegram бота.')
+    encoded_params = urllib.parse.urlencode(params or {})
+    url = TELEGRAM_API_BASE.format(token=token, method=method)
+    if encoded_params:
+        url = f"{url}?{encoded_params}"
+    request = urllib.request.Request(url, headers={'User-Agent': f'VFD-Monitor/{APP_VERSION}'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+    if not payload.get('ok'):
+        raise RuntimeError(payload.get('description') or 'Telegram API вернул ошибку.')
+    return payload.get('result')
+
+
+def update_telegram_bot_profile():
+    if alert_manager is None or not alert_manager.is_configured():
+        return
+    try:
+        profile = telegram_api_request('getMe', timeout=15)
+    except Exception as exc:
+        logging.warning('Не удалось получить профиль Telegram-бота: %s', exc)
+        return
+    username = profile.get('username') or ''
+    if username:
+        alert_manager.set_bot_username(username)
+
+
+def handle_telegram_update(update):
+    if not isinstance(update, dict):
+        return
+    update_id = int(update.get('update_id') or 0)
+    message = update.get('message') or update.get('edited_message') or update.get('channel_post') or update.get('edited_channel_post')
+    if not isinstance(message, dict):
+        alert_manager.set_last_update_id(update_id + 1)
+        return
+    alert = build_alert_from_telegram_message(message, update_id=update_id)
+    if alert is None:
+        alert_manager.set_last_update_id(update_id + 1)
+        return
+    if not alert_manager.is_sender_allowed(alert.get('author_username', ''), alert.get('author_id', '')):
+        logging.info('Telegram alert от %s отклонён whitelist.', alert.get('author_name'))
+        alert_manager.set_last_update_id(update_id + 1)
+        return
+    enqueued = alert_manager.enqueue_alert(alert)
+    alert_manager.set_last_update_id(update_id + 1)
+    preview = trim_vfd_text(enqueued.get('author_name') or 'ALERT', LINE_WIDTH)
+    show_temporary_message('ALERT', preview, duration=1.2)
+    refresh_menu()
+
+
+def toggle_alerts(icon=None, item=None):
+    if alert_manager is None:
+        return
+    snapshot = alert_manager.get_state_snapshot()
+    alert_manager.set_enabled(not snapshot.get('enabled', False))
+    state = alert_manager.get_state_snapshot()
+    if state.get('enabled') and not state.get('bot_token'):
+        show_temporary_message('ALERTS', 'НУЖЕН TOKEN', duration=1.8)
+    elif state.get('enabled'):
+        show_temporary_message('ALERTS', 'TELEGRAM ON', duration=1.8)
+    else:
+        show_temporary_message('ALERTS', 'TELEGRAM OFF', duration=1.8)
+    refresh_menu(icon)
+
+
+def toggle_alerts_whitelist(icon=None, item=None):
+    if alert_manager is None:
+        return
+    snapshot = alert_manager.get_state_snapshot()
+    alert_manager.update_settings(use_whitelist=not snapshot.get('use_whitelist', False))
+    state = alert_manager.get_state_snapshot()
+    show_temporary_message('WHITELIST', 'ON' if state.get('use_whitelist') else 'OFF', duration=1.5)
+    refresh_menu(icon)
+
+
+def telegram_alert_worker_loop():
+    with telegram_poll_state_lock:
+        telegram_poll_state['announced_waiting'] = False
+
+    while app_running:
+        try:
+            state = alert_manager.get_state_snapshot()
+            enabled = state.get('enabled', False)
+            token = state.get('bot_token', '')
+            poll_interval = float(state.get('poll_interval_seconds', 2.0) or 2.0)
+            if not enabled:
+                with telegram_poll_state_lock:
+                    telegram_poll_state['announced_waiting'] = False
+                time.sleep(1.0)
+                continue
+            if not token:
+                alert_manager.set_last_error('Telegram alerts включены, но bot token пустой.')
+                with telegram_poll_state_lock:
+                    telegram_poll_state['announced_waiting'] = False
+                time.sleep(2.0)
+                continue
+
+            if not state.get('bot_username'):
+                update_telegram_bot_profile()
+            with telegram_poll_state_lock:
+                if not telegram_poll_state.get('announced_waiting'):
+                    logging.info('Telegram alerts активированы, ожидание сообщений.')
+                    telegram_poll_state['announced_waiting'] = True
+            offset = int(state.get('last_update_id', 0) or 0)
+            updates = telegram_api_request(
+                'getUpdates',
+                params={
+                    'timeout': TELEGRAM_LONG_POLL_TIMEOUT,
+                    'offset': offset,
+                    'allowed_updates': json.dumps(['message', 'edited_message', 'channel_post', 'edited_channel_post']),
+                },
+                timeout=TELEGRAM_REQUEST_TIMEOUT,
+            ) or []
+            alert_manager.clear_last_error()
+            if not updates:
+                continue
+            for update in updates:
+                handle_telegram_update(update)
+        except Exception as exc:
+            logging.exception('Ошибка Telegram alerts worker')
+            alert_manager.set_last_error(str(exc))
+            time.sleep(max(2.0, poll_interval if 'poll_interval' in locals() else 2.0))
+
+
 # --- ИНТЕРФЕЙС И ТРЕЙ ---
 def toggle_autostart(icon, item):
     cfg["autostart"] = not cfg["autostart"]
@@ -2123,6 +2312,19 @@ def build_line2(disk_read, disk_write, net_in, net_out):
 
 
 
+def create_metrics_sampler(sensor_context):
+    return RuntimeMetricsSampler(
+        cpu_percent_fn=lambda: min(int(psutil.cpu_percent(interval=None)), 99),
+        ram_percent_fn=lambda: min(int(psutil.virtual_memory().percent), 99),
+        cpu_temp_fn=lambda: get_cpu_temp(sensor_context),
+        gpu_metrics_fn=lambda: get_gpu_metrics(sensor_context),
+        net_io_fn=psutil.net_io_counters,
+        disk_io_fn=psutil.disk_io_counters,
+        sample_interval=METRICS_SAMPLE_INTERVAL,
+    )
+
+
+
 def connect_vfd():
     global ser
     port = find_vfd()
@@ -2155,12 +2357,10 @@ def monitoring_thread():
         logging.warning(f"NVML недоступен: {e}")
 
     sensor_context = init_sensor_context()
-
-    last_net = psutil.net_io_counters()
-    last_disk = psutil.disk_io_counters()
-    last_ts = time.time()
+    metrics_sampler = create_metrics_sampler(sensor_context)
+    metrics_sampler.warmup()
     first_connect = True
-    psutil.cpu_percent(interval=None)
+    last_display_ts = 0.0
 
     while app_running:
         if ser is None and not connect_vfd():
@@ -2170,21 +2370,25 @@ def monitoring_thread():
         if first_connect and ser is not None:
             show_greeting()
             first_connect = False
-            last_net = psutil.net_io_counters()
-            last_disk = psutil.disk_io_counters()
-            last_ts = time.time()
+            last_display_ts = time.time()
             continue
 
         try:
+            metrics_sampler.maybe_refresh()
+
             override = get_display_override()
             if override:
+                set_notes_overlay_suspended(True)
                 write_screen(override[0], override[1])
                 time.sleep(0.15)
                 continue
 
             if not is_display_on:
+                set_notes_overlay_suspended(True)
                 time.sleep(0.2)
                 continue
+
+            set_notes_overlay_suspended(False)
 
             overlay_item = get_active_overlay_item()
             if overlay_item is not None:
@@ -2193,27 +2397,15 @@ def monitoring_thread():
                 continue
 
             now = time.time()
-            dt = now - last_ts
-            if dt < current_interval:
+            if last_display_ts and now - last_display_ts < current_interval:
                 time.sleep(0.05)
                 continue
 
-            cpu_percent = min(int(psutil.cpu_percent(interval=None)), 99)
-            ram_percent = min(int(psutil.virtual_memory().percent), 99)
-            cpu_temp = get_cpu_temp(sensor_context)
-            gpu_percent, gpu_temp = get_gpu_metrics(sensor_context)
-
-            net = psutil.net_io_counters()
-            disk = psutil.disk_io_counters()
-            net_in = max((net.bytes_recv - last_net.bytes_recv) / dt, 0)
-            net_out = max((net.bytes_sent - last_net.bytes_sent) / dt, 0)
-            disk_read = max((disk.read_bytes - last_disk.read_bytes) / dt, 0)
-            disk_write = max((disk.write_bytes - last_disk.write_bytes) / dt, 0)
-            last_net, last_disk, last_ts = net, disk, now
-
-            line1 = build_line1(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent)
-            line2 = build_line2(disk_read, disk_write, net_in, net_out)
+            snapshot = metrics_sampler.get_snapshot()
+            line1 = build_line1(snapshot.cpu_percent, snapshot.cpu_temp, snapshot.gpu_percent, snapshot.gpu_temp, snapshot.ram_percent)
+            line2 = build_line2(snapshot.disk_read, snapshot.disk_write, snapshot.net_in, snapshot.net_out)
             write_screen(line1, line2)
+            last_display_ts = now
         except (serial.SerialException, OSError) as e:
             logging.warning(f"Соединение с дисплеем потеряно: {e}")
             try:
@@ -2275,6 +2467,19 @@ def build_notes_reminders_submenu():
     )
 
 
+def build_alerts_submenu():
+    return pystray.Menu(
+        pystray.MenuItem('Включить Telegram alerts', safe_tray_callback(toggle_alerts, refresh_after=True), checked=lambda item: alert_manager.get_state_snapshot().get('enabled', False)),
+        pystray.MenuItem('Whitelist only', safe_tray_callback(toggle_alerts_whitelist, refresh_after=True), checked=lambda item: alert_manager.get_state_snapshot().get('use_whitelist', False)),
+        pystray.MenuItem('Открыть управление alerts', safe_tray_callback(show_alerts_window)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Следующий alert', safe_tray_callback(lambda icon, item: cycle_overlay_item(1), refresh_after=True), enabled=lambda item: bool(alert_manager.get_state_snapshot().get('active_alerts'))),
+        pystray.MenuItem('Предыдущий alert', safe_tray_callback(lambda icon, item: cycle_overlay_item(-1), refresh_after=True), enabled=lambda item: bool(alert_manager.get_state_snapshot().get('active_alerts'))),
+        pystray.MenuItem('Скрыть активный alert', safe_tray_callback(lambda icon, item: hide_active_overlay_item(), refresh_after=True), enabled=lambda item: bool(alert_manager.get_state_snapshot().get('active_alerts'))),
+        pystray.MenuItem('Завершить активный alert', safe_tray_callback(lambda icon, item: complete_active_overlay_item(), refresh_after=True), enabled=lambda item: bool(alert_manager.get_state_snapshot().get('active_alerts'))),
+    )
+
+
 def build_speed_submenu():
     return pystray.Menu(
         pystray.MenuItem('0.5 сек', safe_tray_callback(make_speed_setter(0.5), refresh_after=True), radio=True, checked=lambda item: current_interval == 0.5),
@@ -2291,6 +2496,7 @@ def build_main_menu():
         pystray.MenuItem('Скорость обновления', build_speed_submenu()),
         pystray.MenuItem('Горячие клавиши', build_hotkeys_submenu()),
         pystray.MenuItem('Заметки и напоминания', build_notes_reminders_submenu()),
+        pystray.MenuItem('Telegram alerts', build_alerts_submenu()),
         pystray.MenuItem('Обновления', build_updates_submenu()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('Открыть конфиг', safe_tray_callback(open_config_file)),
@@ -2314,6 +2520,9 @@ def main():
 
     updater = threading.Thread(target=update_worker_loop, daemon=True)
     updater.start()
+
+    telegram_worker = threading.Thread(target=telegram_alert_worker_loop, daemon=True)
+    telegram_worker.start()
 
     hotkey_manager = app_hotkeys.HotkeyManager(lambda: cfg, lambda: HOTKEY_CALLBACKS)
     hotkey_manager.start()

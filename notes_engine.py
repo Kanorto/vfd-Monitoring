@@ -425,6 +425,8 @@ class NotesReminderManager:
         self.active_item_key: tuple[str, str] | None = None
         self.active_page_index = 0
         self.active_started_at = 0.0
+        self.is_suspended = False
+        self.suspended_at = 0.0
         self.load_from_config()
 
     def _load_section(self) -> dict:
@@ -693,6 +695,21 @@ class NotesReminderManager:
             self.active_item_key = (kind, item_id)
             self.active_page_index = 0
             self.active_started_at = time.time()
+
+    def set_suspended(self, suspended: bool):
+        with self.lock:
+            if suspended:
+                if not self.is_suspended:
+                    self.is_suspended = True
+                    self.suspended_at = time.time()
+                return
+            if not self.is_suspended:
+                return
+            paused_for = max(0.0, time.time() - self.suspended_at)
+            if self.active_started_at:
+                self.active_started_at += paused_for
+            self.is_suspended = False
+            self.suspended_at = 0.0
 
     def manual_cycle(self, direction: int):
         with self.lock:
