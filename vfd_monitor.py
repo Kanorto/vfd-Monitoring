@@ -189,6 +189,16 @@ manual_update_feedback = {
 update_alert_lock = threading.Lock()
 hotkey_manager = None
 notes_manager = None
+sensor_cache_lock = threading.Lock()
+sensor_runtime_cache = {
+    "nvidia_smi": {
+        "timestamp": 0.0,
+        "usage": None,
+        "temp": None,
+    },
+    "logged_sources": set(),
+    "logged_failures": set(),
+}
 
 
 def ensure_dir(path):
@@ -288,6 +298,7 @@ def load_config():
         "known_latest_version": APP_VERSION,
         "pending_update_version": "",
         "pending_update_path": "",
+        "pending_update_target": "",
         "pending_update_notes": "",
         "last_changelog_version": "",
         "last_changelog": "",
@@ -648,21 +659,19 @@ def pick_release_asset(release):
 
     current_name = os.path.basename(sys.executable if getattr(sys, 'frozen', False) else __file__).lower()
     exact_match = None
-    python_asset = None
+    exe_assets = []
 
     for asset in assets:
         asset_name = asset.get('name', '').lower()
-        if asset_name == current_name:
+        if asset_name == current_name and asset_name.endswith('.exe'):
             exact_match = asset
         if asset_name.endswith('.exe'):
-            return asset
-        if asset_name.endswith('.py') and python_asset is None:
-            python_asset = asset
+            exe_assets.append(asset)
     if exact_match is not None:
         return exact_match
-    if python_asset is not None:
-        return python_asset
-    return assets[0]
+    if exe_assets:
+        return exe_assets[0]
+    raise RuntimeError('В релизе нет .exe-файла. Автообновление поддерживает только готовый Windows-бинарник и не требует Python у клиента.')
 
 
 
@@ -893,14 +902,33 @@ def get_autostart_command():
 
 
 
-def build_update_script(target_path, staged_path):
-    launch_cmd = subprocess.list2cmdline(get_launch_command())
+def resolve_pending_update_target(pending_path=''):
+    configured_target = cfg.get('pending_update_target', '')
+    if configured_target:
+        return configured_target
+    if getattr(sys, 'frozen', False):
+        return sys.executable
+    pending_name = os.path.basename(pending_path or '') or 'VFD PC Monitor.exe'
+    return os.path.join(get_base_path(), pending_name)
+
+
+def get_release_target_path(release_info):
+    asset_name = os.path.basename(release_info.get('asset_name', '') or '')
+    if not asset_name.lower().endswith('.exe'):
+        raise RuntimeError('Автообновление принимает только .exe-релизы, чтобы приложение не зависело от установленного Python.')
+    if getattr(sys, 'frozen', False):
+        return os.path.abspath(sys.executable)
+    return os.path.join(get_base_path(), asset_name)
+
+
+def build_update_script(target_path, staged_path, launch_path):
     script_path = os.path.join(tempfile.gettempdir(), 'vfd_apply_update.cmd')
     lines = [
         '@echo off',
         'setlocal enabledelayedexpansion',
         f'set "TARGET={target_path}"',
         f'set "STAGED={staged_path}"',
+        f'set "LAUNCH={launch_path}"',
         'for /l %%I in (1,1,90) do (',
         '  copy /Y "!STAGED!" "!TARGET!" >nul 2>&1 && goto copied',
         '  timeout /t 1 /nobreak >nul',
@@ -908,7 +936,7 @@ def build_update_script(target_path, staged_path):
         'exit /b 1',
         ':copied',
         'del /Q "!STAGED!" >nul 2>&1',
-        f'start "" {launch_cmd}',
+        'start "" "!LAUNCH!"',
         'del "%~f0" >nul 2>&1',
         'exit /b 0',
     ]
@@ -924,10 +952,13 @@ def schedule_pending_update_install():
     if not pending_path or not os.path.exists(pending_path):
         return False
 
-    target_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
-    script_path = build_update_script(target_path, pending_path)
+    target_path = resolve_pending_update_target(pending_path)
+    if not target_path.lower().endswith('.exe'):
+        raise RuntimeError('Автообновление ожидает установку .exe-файла и не поддерживает запуск через Python.')
+
+    script_path = build_update_script(target_path, pending_path, target_path)
     show_temporary_message('ОБНОВЛЕНИЕ', f'УСТАНОВКА {pending_version}', duration=2)
-    logging.info(f"Запущена установка обновления {pending_version} из {pending_path}")
+    logging.info(f"Запущена установка обновления {pending_version} из {pending_path} в {target_path}")
     subprocess.Popen(['cmd', '/c', script_path], close_fds=True)
     return True
 
@@ -963,6 +994,7 @@ def announce_version_change():
     cfg['known_latest_version'] = max(current_version, sanitize_version(cfg.get('known_latest_version', current_version)), key=parse_version_parts)
     cfg['pending_update_version'] = ''
     cfg['pending_update_path'] = ''
+    cfg['pending_update_target'] = ''
     cfg['pending_update_notes'] = ''
     cfg['update_failure_count'] = 0
     cfg['last_update_error'] = ''
@@ -1093,6 +1125,7 @@ def check_for_updates(force=False):
         if pending_version and not os.path.exists(cfg.get('pending_update_path', '')):
             cfg['pending_update_version'] = ''
             cfg['pending_update_path'] = ''
+            cfg['pending_update_target'] = ''
             cfg['pending_update_notes'] = ''
             save_config(cfg)
             pending_version = ''
@@ -1144,6 +1177,7 @@ def download_and_stage_update(release_info):
 
         cfg['pending_update_version'] = release_info['version']
         cfg['pending_update_path'] = final_path
+        cfg['pending_update_target'] = get_release_target_path(release_info)
         cfg['pending_update_notes'] = release_info['notes']
         cfg['known_latest_version'] = release_info['version']
         cfg['last_release_url'] = release_info.get('release_url', '')
@@ -1578,30 +1612,422 @@ def create_image():
 
 
 # --- СБОР СТАТИСТИКИ ---
-def get_cpu_temp(wmi_obj):
-    if not wmi_obj:
-        return None
+def clamp_percent(value):
     try:
-        zones = wmi_obj.MSAcpi_ThermalZoneTemperature()
-        if zones:
-            temp = (zones[0].CurrentTemperature / 10.0) - 273.15
-            return min(int(temp), 99) if 10 < temp < 110 else None
-    except Exception:
+        percent = int(float(value))
+    except (TypeError, ValueError):
         return None
+    return max(0, min(percent, 99))
+
+
+def clamp_temperature(value):
+    try:
+        temp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 10 <= temp <= 110:
+        return max(0, min(int(temp), 99))
     return None
 
 
+def log_sensor_source_once(kind, source_name):
+    if not source_name:
+        return
+    with sensor_cache_lock:
+        logged = sensor_runtime_cache.setdefault("logged_sources", set())
+        key = f"{kind}:{source_name}"
+        if key in logged:
+            return
+        logged.add(key)
+    logging.info(f"Источник {kind}: {source_name}")
 
-def get_gpu_metrics():
+
+def log_sensor_failure_once(kind, source_name, reason):
+    if not source_name or not reason:
+        return
+    message = str(reason).strip()
+    if not message:
+        return
+    with sensor_cache_lock:
+        logged = sensor_runtime_cache.setdefault("logged_failures", set())
+        key = f"{kind}:{source_name}:{message}"
+        if key in logged:
+            return
+        logged.add(key)
+    logging.warning(f"Не удалось получить {kind} через {source_name}: {message}")
+
+
+def open_wmi_namespace(namespace):
+    try:
+        return wmi.WMI(namespace=namespace)
+    except Exception as exc:
+        logging.warning(f"WMI namespace {namespace} недоступен: {exc}")
+        return None
+
+
+def init_sensor_context():
+    return {
+        "wmi_acpi": open_wmi_namespace("root\\wmi"),
+        "wmi_gpu_perf": open_wmi_namespace("root\\cimv2"),
+        "wmi_openhardware": open_wmi_namespace("root\\OpenHardwareMonitor"),
+        "wmi_librehardware": open_wmi_namespace("root\\LibreHardwareMonitor"),
+        "nvidia_smi_path": shutil.which("nvidia-smi") or shutil.which("nvidia-smi.exe"),
+    }
+
+
+def collect_sensor_candidates(sensor_row):
+    candidates = []
+    for attr in ("Name", "Identifier", "Parent", "SensorType", "Hardware", "HardwareType"):
+        value = getattr(sensor_row, attr, None)
+        if value:
+            candidates.append(str(value))
+    return " ".join(candidates).lower()
+
+
+def score_cpu_sensor_text(text):
+    score = 0
+    if any(token in text for token in ("cpu package", "package", "tctl", "tdie", "cpu die", "die")):
+        score += 60
+    if any(token in text for token in ("ccd", "core average", "average")):
+        score += 40
+    if "core" in text:
+        score += 20
+    if "cpu" in text or "/amdcpu/" in text or "/intelcpu/" in text:
+        score += 15
+    if any(token in text for token in ("gpu", "pch", "vrm", "motherboard", "system", "ambient")):
+        score -= 80
+    return score
+
+
+def get_hardware_monitor_temperature(wmi_obj, target):
+    if not wmi_obj:
+        return None, None, "namespace недоступен"
+    try:
+        sensors = wmi_obj.Sensor()
+    except Exception as exc:
+        return None, None, f"ошибка WMI-запроса Sensor(): {exc}"
+
+    best_temp = None
+    best_score = None
+    matched_target = False
+    invalid_values = 0
+    for sensor in sensors:
+        sensor_type = str(getattr(sensor, "SensorType", "") or "").lower()
+        if sensor_type != "temperature":
+            continue
+
+        text = collect_sensor_candidates(sensor)
+        if target == "cpu":
+            if "cpu" not in text and "/amdcpu/" not in text and "/intelcpu/" not in text:
+                continue
+            matched_target = True
+            score = score_cpu_sensor_text(text)
+        else:
+            if "gpu" not in text:
+                continue
+            matched_target = True
+            score = 50
+            if any(token in text for token in ("core", "edge", "hot spot", "hotspot", "junction", "gpu temperature")):
+                score += 30
+            if any(token in text for token in ("memory", "mem", "vrm")):
+                score -= 40
+
+        temp = clamp_temperature(getattr(sensor, "Value", None))
+        if temp is None:
+            invalid_values += 1
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_temp = temp
+
+    if best_temp is not None:
+        return best_temp, best_score, None
+    if matched_target:
+        if invalid_values:
+            return None, None, "подходящие температурные датчики найдены, но значения пустые или вне диапазона"
+        return None, None, "подходящие температурные датчики найдены, но не удалось выбрать валидное значение"
+    return None, None, f"не найдено подходящих {target.upper()}-температурных датчиков"
+
+
+def get_psutil_cpu_temp():
+    try:
+        sensors = psutil.sensors_temperatures(fahrenheit=False)
+    except (AttributeError, NotImplementedError):
+        return None, "psutil.sensors_temperatures() не поддерживается в текущей среде"
+    except Exception as exc:
+        return None, f"ошибка psutil.sensors_temperatures(): {exc}"
+
+    best_temp = None
+    best_score = None
+    seen_entries = 0
+    for name, entries in sensors.items():
+        name_text = str(name or "").lower()
+        for entry in entries:
+            seen_entries += 1
+            text = " ".join(
+                part.lower()
+                for part in (
+                    name_text,
+                    getattr(entry, "label", "") or "",
+                )
+                if part
+            )
+            score = score_cpu_sensor_text(text)
+            temp = clamp_temperature(getattr(entry, "current", None))
+            if temp is None:
+                continue
+            if best_score is None or score > best_score:
+                best_score = score
+                best_temp = temp
+    if best_temp is not None:
+        return best_temp, None
+    if seen_entries:
+        return None, "датчики psutil найдены, но не содержат валидной температуры CPU"
+    return None, "psutil не вернул ни одного температурного датчика"
+
+
+def get_acpi_cpu_temp(wmi_obj):
+    if not wmi_obj:
+        return None, "namespace root\\wmi недоступен"
+    try:
+        zones = wmi_obj.MSAcpi_ThermalZoneTemperature()
+    except Exception as exc:
+        return None, f"ошибка запроса MSAcpi_ThermalZoneTemperature(): {exc}"
+
+    invalid_values = 0
+    for zone in zones:
+        raw_value = getattr(zone, "CurrentTemperature", None)
+        if raw_value is None:
+            continue
+        temp = clamp_temperature((raw_value / 10.0) - 273.15)
+        if temp is not None:
+            return temp, None
+        invalid_values += 1
+    if invalid_values:
+        return None, "ACPI-зоны найдены, но температуры вне допустимого диапазона"
+    return None, "ACPI не вернул доступных thermal zone датчиков"
+
+
+def get_cpu_temp(sensor_context):
+    for namespace_key, namespace_name in (
+        ("wmi_librehardware", "LibreHardwareMonitor WMI"),
+        ("wmi_openhardware", "OpenHardwareMonitor WMI"),
+    ):
+        temp, score, reason = get_hardware_monitor_temperature(sensor_context.get(namespace_key), "cpu")
+        if temp is not None and score is not None and score >= 0:
+            log_sensor_source_once("температуры CPU", namespace_name)
+            return temp
+        log_sensor_failure_once("температуры CPU", namespace_name, reason)
+
+    temp, reason = get_psutil_cpu_temp()
+    if temp is not None:
+        log_sensor_source_once("температуры CPU", "psutil sensors_temperatures")
+        return temp
+    log_sensor_failure_once("температуры CPU", "psutil sensors_temperatures", reason)
+
+    temp, reason = get_acpi_cpu_temp(sensor_context.get("wmi_acpi"))
+    if temp is not None:
+        log_sensor_source_once("температуры CPU", "ACPI thermal zone")
+        return temp
+    log_sensor_failure_once("температуры CPU", "ACPI thermal zone", reason)
+
+    return None
+
+
+def parse_nvidia_smi_query(path):
+    if not path:
+        return None, None, {
+            "usage": "nvidia-smi не найден в PATH",
+            "temp": "nvidia-smi не найден в PATH",
+        }
+    now = time.time()
+    with sensor_cache_lock:
+        cached = sensor_runtime_cache.setdefault("nvidia_smi", {"timestamp": 0.0, "usage": None, "temp": None})
+        if now - cached["timestamp"] < 2.0:
+            return cached["usage"], cached["temp"], {
+                "usage": "данные отсутствуют в кэше nvidia-smi",
+                "temp": "данные отсутствуют в кэше nvidia-smi",
+            }
+
+    startupinfo = None
+    if os.name == "nt" and hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    try:
+        result = subprocess.run(
+            [
+                path,
+                "--query-gpu=utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+            startupinfo=startupinfo,
+        )
+    except Exception as exc:
+        return None, None, {
+            "usage": f"ошибка запуска nvidia-smi: {exc}",
+            "temp": f"ошибка запуска nvidia-smi: {exc}",
+        }
+
+    usage_values = []
+    temp_values = []
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        usage = clamp_percent(parts[0])
+        temp = clamp_temperature(parts[1])
+        if usage is not None:
+            usage_values.append(usage)
+        if temp is not None:
+            temp_values.append(temp)
+
+    usage = max(usage_values) if usage_values else None
+    temp = max(temp_values) if temp_values else None
+    with sensor_cache_lock:
+        cached = sensor_runtime_cache.setdefault("nvidia_smi", {"timestamp": 0.0, "usage": None, "temp": None})
+        cached.update({"timestamp": now, "usage": usage, "temp": temp})
+    return usage, temp, {
+        "usage": None if usage is not None else "nvidia-smi отработал, но не вернул валидную загрузку GPU",
+        "temp": None if temp is not None else "nvidia-smi отработал, но не вернул валидную температуру GPU",
+    }
+
+
+def get_nvml_gpu_metrics():
+    try:
+        device_count = nvml.nvmlDeviceGetCount()
+    except Exception as exc:
+        return None, None, {
+            "usage": f"NVML недоступен: {exc}",
+            "temp": f"NVML недоступен: {exc}",
+        }
+
+    usage_values = []
+    temp_values = []
+    usage_errors = []
+    temp_errors = []
+    for index in range(device_count):
+        try:
+            handle = nvml.nvmlDeviceGetHandleByIndex(index)
+        except Exception as exc:
+            usage_errors.append(f"GPU {index}: handle недоступен ({exc})")
+            temp_errors.append(f"GPU {index}: handle недоступен ({exc})")
+            continue
+        try:
+            usage = clamp_percent(nvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+            if usage is not None:
+                usage_values.append(usage)
+            else:
+                usage_errors.append(f"GPU {index}: NVML вернул пустую/некорректную загрузку")
+        except Exception as exc:
+            usage_errors.append(f"GPU {index}: nvmlDeviceGetUtilizationRates() -> {exc}")
+        try:
+            temp = clamp_temperature(nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU))
+            if temp is not None:
+                temp_values.append(temp)
+            else:
+                temp_errors.append(f"GPU {index}: NVML вернул пустую/некорректную температуру")
+        except Exception as exc:
+            temp_errors.append(f"GPU {index}: nvmlDeviceGetTemperature() -> {exc}")
+
+    return (
+        max(usage_values) if usage_values else None,
+        max(temp_values) if temp_values else None,
+        {
+            "usage": None if usage_values else ("; ".join(usage_errors) if usage_errors else "NVML не вернул ни одной загрузки GPU"),
+            "temp": None if temp_values else ("; ".join(temp_errors) if temp_errors else "NVML не вернул ни одной температуры GPU"),
+        },
+    )
+
+
+def get_windows_gpu_usage(wmi_obj):
+    if not wmi_obj:
+        return None, "namespace root\\cimv2 недоступен"
+    try:
+        engines = wmi_obj.Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine()
+    except Exception as exc:
+        return None, f"ошибка запроса Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine(): {exc}"
+
+    usage_values = []
+    matching_engines = 0
+    for engine in engines:
+        name = str(getattr(engine, "Name", "") or "").lower()
+        if "engtype_" not in name:
+            continue
+        if any(token in name for token in ("engtype_3d", "engtype_compute", "engtype_cuda", "engtype_copy", "engtype_video")):
+            matching_engines += 1
+            usage = clamp_percent(getattr(engine, "UtilizationPercentage", None))
+            if usage is not None:
+                usage_values.append(usage)
+
+    if not usage_values:
+        if matching_engines:
+            return None, "GPU Engine Counters найдены, но не содержат валидной загрузки"
+        return None, "Windows не вернул подходящих GPU Engine Counters"
+    return max(usage_values), None
+
+
+def get_gpu_monitor_temperature(sensor_context):
+    for namespace_key, namespace_name in (
+        ("wmi_librehardware", "LibreHardwareMonitor WMI"),
+        ("wmi_openhardware", "OpenHardwareMonitor WMI"),
+    ):
+        temp, _, reason = get_hardware_monitor_temperature(sensor_context.get(namespace_key), "gpu")
+        if temp is not None:
+            log_sensor_source_once("температуры GPU", namespace_name)
+            return temp
+        log_sensor_failure_once("температуры GPU", namespace_name, reason)
+    return None
+
+
+def get_gpu_metrics(sensor_context):
     if not cfg.get("show_gpu_usage", True) and not cfg.get("show_gpu_temp", True):
         return None, None
-    try:
-        handle = nvml.nvmlDeviceGetHandleByIndex(0)
-        util = nvml.nvmlDeviceGetUtilizationRates(handle).gpu
-        temp = nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
-        return min(int(util), 99), min(int(temp), 99)
-    except Exception:
-        return None, None
+
+    usage = None
+    temp = None
+
+    nvml_usage, nvml_temp, nvml_reasons = get_nvml_gpu_metrics()
+    if nvml_usage is not None:
+        usage = nvml_usage
+        log_sensor_source_once("загрузки GPU", "NVML")
+    else:
+        log_sensor_failure_once("загрузки GPU", "NVML", nvml_reasons.get("usage"))
+    if nvml_temp is not None:
+        temp = nvml_temp
+        log_sensor_source_once("температуры GPU", "NVML")
+    else:
+        log_sensor_failure_once("температуры GPU", "NVML", nvml_reasons.get("temp"))
+
+    if usage is None or temp is None:
+        cli_usage, cli_temp, cli_reasons = parse_nvidia_smi_query(sensor_context.get("nvidia_smi_path"))
+        if usage is None and cli_usage is not None:
+            usage = cli_usage
+            log_sensor_source_once("загрузки GPU", "nvidia-smi")
+        elif usage is None:
+            log_sensor_failure_once("загрузки GPU", "nvidia-smi", cli_reasons.get("usage"))
+        if temp is None and cli_temp is not None:
+            temp = cli_temp
+            log_sensor_source_once("температуры GPU", "nvidia-smi")
+        elif temp is None:
+            log_sensor_failure_once("температуры GPU", "nvidia-smi", cli_reasons.get("temp"))
+
+    if usage is None:
+        perf_usage, reason = get_windows_gpu_usage(sensor_context.get("wmi_gpu_perf"))
+        if perf_usage is not None:
+            usage = perf_usage
+            log_sensor_source_once("загрузки GPU", "Windows GPU Engine Counters")
+        else:
+            log_sensor_failure_once("загрузки GPU", "Windows GPU Engine Counters", reason)
+
+    if temp is None:
+        temp = get_gpu_monitor_temperature(sensor_context)
+
+    return usage, temp
 
 
 
@@ -1728,11 +2154,7 @@ def monitoring_thread():
     except Exception as e:
         logging.warning(f"NVML недоступен: {e}")
 
-    wmi_namespace = None
-    try:
-        wmi_namespace = wmi.WMI(namespace="root\\wmi")
-    except Exception as e:
-        logging.warning(f"WMI namespace root\\wmi недоступен: {e}")
+    sensor_context = init_sensor_context()
 
     last_net = psutil.net_io_counters()
     last_disk = psutil.disk_io_counters()
@@ -1778,8 +2200,8 @@ def monitoring_thread():
 
             cpu_percent = min(int(psutil.cpu_percent(interval=None)), 99)
             ram_percent = min(int(psutil.virtual_memory().percent), 99)
-            cpu_temp = get_cpu_temp(wmi_namespace)
-            gpu_percent, gpu_temp = get_gpu_metrics()
+            cpu_temp = get_cpu_temp(sensor_context)
+            gpu_percent, gpu_temp = get_gpu_metrics(sensor_context)
 
             net = psutil.net_io_counters()
             disk = psutil.disk_io_counters()
