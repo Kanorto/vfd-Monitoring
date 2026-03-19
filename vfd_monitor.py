@@ -35,7 +35,7 @@ from notes_engine import DEFAULT_STATE as NOTES_DEFAULT_STATE, NotesReminderMana
 from notes_gui import open_notes_reminders_window
 
 # --- НАСТРОЙКИ VFD ---
-APP_VERSION = os.environ.get("VFD_MONITOR_VERSION", "1.0.2")
+APP_VERSION = os.environ.get("VFD_MONITOR_VERSION", "1.1.0")
 BAUD = 9600
 CLR = b'\x0c'
 HOME = b'\x0b'
