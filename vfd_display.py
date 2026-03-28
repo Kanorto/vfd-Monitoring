@@ -223,7 +223,7 @@ def expand_io_variants(rendered: str, full_label: str, short_label: str) -> list
 
 
 
-def build_io_segments(cfg: dict, default_metric_formats: dict, disk_read, disk_write, net_in, net_out) -> list[list[str]]:
+def build_io_segments(cfg: dict, default_metric_formats: dict, disk_read, disk_write, net_in, net_out, gpu_top_proc=None) -> list[list[str]]:
     segments = []
     if cfg.get("show_disk", True):
         disk_options = []
@@ -241,6 +241,14 @@ def build_io_segments(cfg: dict, default_metric_formats: dict, disk_read, disk_w
                 _add_unique(network_options, candidate)
         if network_options:
             segments.append(network_options)
+    if cfg.get("show_gpu_proc", False) and gpu_top_proc:
+        name, pid = gpu_top_proc
+        proc_options = []
+        for template in get_metric_templates(cfg.get("metric_formats", {}), default_metric_formats, "gpu_proc"):
+            rendered = apply_template(template, name=name, pid=pid)
+            _add_unique(proc_options, rendered)
+        if proc_options:
+            segments.append(proc_options)
     return segments
 
 
@@ -256,11 +264,11 @@ def build_line1(cfg: dict, default_line_spacing: dict, default_metric_formats: d
     )
 
 
-def build_line2(cfg: dict, default_line_spacing: dict, default_metric_formats: dict, special_chars: dict[str, bytes], disk_read, disk_write, net_in, net_out, width: int = LINE_WIDTH) -> str:
+def build_line2(cfg: dict, default_line_spacing: dict, default_metric_formats: dict, special_chars: dict[str, bytes], disk_read, disk_write, net_in, net_out, gpu_top_proc=None, width: int = LINE_WIDTH) -> str:
     spacing = deepcopy(default_line_spacing)
     spacing.update(cfg.get("line_spacing", {}) if isinstance(cfg.get("line_spacing"), dict) else {})
     return render_segments(
-        build_io_segments(cfg, default_metric_formats, disk_read, disk_write, net_in, net_out),
+        build_io_segments(cfg, default_metric_formats, disk_read, disk_write, net_in, net_out, gpu_top_proc=gpu_top_proc),
         width=width,
         separator=spacing.get("secondary", " "),
         compact_separator=spacing.get("secondary_compact", ""),
