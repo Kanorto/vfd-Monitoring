@@ -26,6 +26,7 @@ class MetricsSnapshot:
     disk_write: float = 0.0
     net_in: float = 0.0
     net_out: float = 0.0
+    gpu_top_proc: tuple | None = None  # (display_name, pid)
 
 
 class RuntimeMetricsSampler:
@@ -36,6 +37,7 @@ class RuntimeMetricsSampler:
         ram_percent_fn,
         cpu_temp_fn,
         gpu_metrics_fn,
+        gpu_proc_fn=None,
         net_io_fn,
         disk_io_fn,
         sample_interval: float = 1.0,
@@ -44,6 +46,7 @@ class RuntimeMetricsSampler:
         self.ram_percent_fn = ram_percent_fn
         self.cpu_temp_fn = cpu_temp_fn
         self.gpu_metrics_fn = gpu_metrics_fn
+        self.gpu_proc_fn = gpu_proc_fn
         self.net_io_fn = net_io_fn
         self.disk_io_fn = disk_io_fn
         self.sample_interval = max(0.1, float(sample_interval))
@@ -90,6 +93,7 @@ class RuntimeMetricsSampler:
             ram_percent = self.ram_percent_fn()
             cpu_temp = self.cpu_temp_fn()
             gpu_percent, gpu_temp = self.gpu_metrics_fn()
+            gpu_top_proc = self.gpu_proc_fn() if self.gpu_proc_fn else None
             self.snapshot = MetricsSnapshot(
                 sampled_at=now,
                 cpu_percent=int(cpu_percent),
@@ -101,6 +105,7 @@ class RuntimeMetricsSampler:
                 disk_write=self._compute_rate(current_counters.write_bytes, previous_counters.write_bytes, dt),
                 net_in=self._compute_rate(current_counters.bytes_recv, previous_counters.bytes_recv, dt),
                 net_out=self._compute_rate(current_counters.bytes_sent, previous_counters.bytes_sent, dt),
+                gpu_top_proc=gpu_top_proc,
             )
             self.previous_counters = current_counters
             return self.snapshot

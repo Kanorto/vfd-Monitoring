@@ -55,6 +55,7 @@ DISPLAY_FLAGS = {
     "show_ram": "RAM %",
     "show_disk": "Диск",
     "show_network": "Сеть",
+    "show_gpu_proc": "GPU процесс",
 }
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 TELEGRAM_LONG_POLL_TIMEOUT = 25
@@ -113,6 +114,13 @@ DEFAULT_METRIC_FORMATS = {
         "n:{recv}/{send}",
         "net{recv}/{send}",
         "n{recv}/{send}",
+    ],
+    "gpu_proc": [
+        "GPU>{name}",
+        ">{name}",
+        "{name}",
+        ">{pid}",
+        "{pid}",
     ],
 }
 DEFAULT_LINE_SPACING = {
@@ -306,6 +314,7 @@ def load_config():
         "show_ram": True,
         "show_disk": True,
         "show_network": True,
+        "show_gpu_proc": False,
         "autostart": False,
         "update_interval": 1.0,
         "app_version": APP_VERSION,
@@ -2133,6 +2142,119 @@ def get_nvml_gpu_metrics():
     )
 
 
+def get_nvml_gpu_top_process():
+    """Returns (pid, used_memory_bytes) of the process using most GPU memory via NVML, or (None, reason)."""
+    try:
+        device_count = nvml.nvmlDeviceGetCount()
+    except Exception as exc:
+        return None, f"NVML недоступен: {exc}"
+
+    best_pid = None
+    best_mem = 0
+
+    for index in range(device_count):
+        try:
+            handle = nvml.nvmlDeviceGetHandleByIndex(index)
+        except Exception:
+            continue
+        for get_procs_fn in (
+            nvml.nvmlDeviceGetComputeRunningProcesses,
+            nvml.nvmlDeviceGetGraphicsRunningProcesses,
+        ):
+            try:
+                procs = get_procs_fn(handle)
+                for proc in procs:
+                    mem = getattr(proc, "usedGpuMemory", 0) or 0
+                    if mem > best_mem:
+                        best_mem = mem
+                        best_pid = proc.pid
+            except Exception:
+                continue
+
+    if best_pid is None:
+        return None, "Нет активных GPU-процессов"
+    return best_pid, None
+
+
+def parse_nvidia_smi_proc_query(path):
+    """Returns pid of the top GPU-memory process via nvidia-smi, or (None, reason)."""
+    if not path:
+        return None, "nvidia-smi не найден в PATH"
+    now = time.time()
+    with sensor_cache_lock:
+        cached = sensor_runtime_cache.setdefault(
+            "nvidia_smi_proc", {"timestamp": 0.0, "pid": None}
+        )
+        if now - cached["timestamp"] < 2.0:
+            pid = cached["pid"]
+            return pid, (None if pid is not None else "данные отсутствуют в кэше nvidia-smi proc")
+
+    startupinfo = None
+    if os.name == "nt" and hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    best_pid = None
+    best_mem = -1
+    for query in ("--query-apps=pid,used_memory", "--query-compute-apps=pid,used_memory"):
+        try:
+            result = subprocess.run(
+                [path, query, "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True,
+                startupinfo=startupinfo,
+            )
+        except Exception:
+            continue
+        for line in result.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+                mem = int(parts[1])
+            except ValueError:
+                continue
+            if mem > best_mem:
+                best_mem = mem
+                best_pid = pid
+        if best_pid is not None:
+            break
+
+    with sensor_cache_lock:
+        cached = sensor_runtime_cache.setdefault(
+            "nvidia_smi_proc", {"timestamp": 0.0, "pid": None}
+        )
+        cached.update({"timestamp": now, "pid": best_pid})
+
+    if best_pid is None:
+        return None, "nvidia-smi не вернул активных GPU-процессов"
+    return best_pid, None
+
+
+def get_gpu_top_process(sensor_context):
+    """Returns (display_name, pid) of the process using most GPU, or None."""
+    if not cfg.get("show_gpu_proc", False):
+        return None
+
+    pid, _ = get_nvml_gpu_top_process()
+    if pid is None:
+        pid, _ = parse_nvidia_smi_proc_query(sensor_context.get("nvidia_smi_path"))
+    if pid is None:
+        return None
+
+    try:
+        name = psutil.Process(pid).name()
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        name = name[:12]
+    except Exception:
+        name = "?"
+    return name, pid
+
+
 def get_windows_gpu_usage(wmi_obj):
     if not wmi_obj:
         return None, "namespace root\\cimv2 недоступен"
@@ -2297,7 +2419,7 @@ def build_line1(cpu_percent, cpu_temp, gpu_percent, gpu_temp, ram_percent):
 
 
 
-def build_line2(disk_read, disk_write, net_in, net_out):
+def build_line2(disk_read, disk_write, net_in, net_out, gpu_top_proc=None):
     return vfd_display.build_line2(
         cfg,
         DEFAULT_LINE_SPACING,
@@ -2307,6 +2429,7 @@ def build_line2(disk_read, disk_write, net_in, net_out):
         disk_write,
         net_in,
         net_out,
+        gpu_top_proc=gpu_top_proc,
         width=LINE_WIDTH,
     )
 
@@ -2318,6 +2441,7 @@ def create_metrics_sampler(sensor_context):
         ram_percent_fn=lambda: min(int(psutil.virtual_memory().percent), 99),
         cpu_temp_fn=lambda: get_cpu_temp(sensor_context),
         gpu_metrics_fn=lambda: get_gpu_metrics(sensor_context),
+        gpu_proc_fn=lambda: get_gpu_top_process(sensor_context),
         net_io_fn=psutil.net_io_counters,
         disk_io_fn=psutil.disk_io_counters,
         sample_interval=METRICS_SAMPLE_INTERVAL,
@@ -2403,7 +2527,7 @@ def monitoring_thread():
 
             snapshot = metrics_sampler.get_snapshot()
             line1 = build_line1(snapshot.cpu_percent, snapshot.cpu_temp, snapshot.gpu_percent, snapshot.gpu_temp, snapshot.ram_percent)
-            line2 = build_line2(snapshot.disk_read, snapshot.disk_write, snapshot.net_in, snapshot.net_out)
+            line2 = build_line2(snapshot.disk_read, snapshot.disk_write, snapshot.net_in, snapshot.net_out, gpu_top_proc=snapshot.gpu_top_proc)
             write_screen(line1, line2)
             last_display_ts = now
         except (serial.SerialException, OSError) as e:
